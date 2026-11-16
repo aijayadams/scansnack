@@ -27,11 +27,21 @@ class Diagnosable(Protocol):
         ...
 
 
+@runtime_checkable
+class PasswordProtected(Protocol):
+    """Optional for a ``ScannerPort``: a scanner that wants a password (``core.errors.PasswordRejected``)."""
+
+    def set_password(self, password: str) -> None:
+        """Remember ``password`` on this computer; the next :meth:`ScannerPort.connect` uses it. No network I/O."""
+        ...
+
+
 class ScannerPort(Protocol):
     """A scanner behind a fixed address.
 
     :meth:`scan` blocks (network I/O) and must not run in the GUI thread. Raises ``core.errors.NoPaper``
-    when the feeder is empty, ``core.errors.FeedError`` on paper errors and ``OSError`` on connection problems.
+    when the feeder is empty, ``core.errors.FeedError`` on paper errors,
+    ``core.errors.PasswordRejected`` if the scanner wants a (different) password and ``OSError`` on connection problems.
     """
 
     @property

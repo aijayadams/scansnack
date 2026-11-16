@@ -9,6 +9,16 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 
 ## [Unreleased]
 
+### Added
+
+- iX500: when the scanner does not accept its Wi-Fi password, the app now asks for it and remembers it,
+  instead of failing on every start. The message says whether the factory password (the last four digits
+  of the serial number) was tried or whether the scanner's name hides the serial number.
+
+### Fixed
+
+- Error reports no longer show the iX500 password setting as `<private> default`.
+
 ## [0.6.1] - 2026-11-08
 
 ### Changed

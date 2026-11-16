@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -55,13 +56,13 @@ from PySide6.QtWidgets import (
 
 from ...core import report as error_report
 from ...core.document import FEED_HELP, PRESETS, Entry, Preset, ScanPage, default_name, thumbnail
-from ...core.errors import FeedError, NoPaper
+from ...core.errors import FeedError, NoPaper, PasswordRejected
 from ...core.fixes import AVAILABLE as AVAILABLE_FIXES
 from ...core.fixes import Fix, Fixes
 from ...core.images import is_blank
 from ...core.model import FoundScanner, ScanSettings
 from ...ports.output import OutputPort
-from ...ports.scanner import Diagnosable, PaperSensor, ScannerLocator, ScannerPort
+from ...ports.scanner import Diagnosable, PaperSensor, PasswordProtected, ScannerLocator, ScannerPort
 from . import primer
 from .report import ReportDialog, qt_fields
 from .updates import UpdateChecker, Updates
@@ -100,6 +101,7 @@ class ScanWorker(QObject):
     status = Signal(str)
     done = Signal(str, bool)  # error message ("" = ok), connection problem?
     button = Signal()  # "Scan" pressed on the touch panel (from the listener thread)
+    password_needed = Signal(str)  # the scanner rejected its password (PasswordRejected): reason
 
     def __init__(self, ip: str, locator: ScannerLocator):
         super().__init__()
@@ -109,6 +111,7 @@ class ScanWorker(QObject):
         self.device_ip = ""
         self.last_preset: Preset | None = None
         self.last_traceback = ""  # of the last unexpected scan error, for the error report
+        self.password_asked = False  # the reconnect timer asks only once until a password is entered
 
     def _device(self) -> ScannerPort:
         """Persistently connected device for the current IP (disconnect the old one when the IP changes)."""
@@ -130,8 +133,23 @@ class ScanWorker(QObject):
             device.connect()  # also restarts what failed earlier (button listener, heartbeat)
             if not was_connected:
                 self.status.emit("Connected to the scanner.")
+        except PasswordRejected as e:
+            print(f"Connecting at startup failed: {e}", file=sys.stderr)
+            if not self.password_asked:
+                self.password_asked = True
+                self.password_needed.emit(str(e))
         except Exception as e:  # noqa: BLE001
             print(f"Connecting at startup failed: {e}", file=sys.stderr)
+
+    @Slot(str)
+    def set_password(self, password: str) -> None:
+        """Password entered by the user: remember it and connect with it."""
+        device = self._device()
+        if isinstance(device, PasswordProtected):
+            device.set_password(password)
+        self.password_asked = False
+        self.status.emit("Connecting with the new password …")
+        self.open_connection()
 
     def close_connection(self) -> None:
         if self.device is not None:
@@ -165,6 +183,12 @@ class ScanWorker(QObject):
             if count:
                 text += f"\n\nThe {count} page(s) scanned before are kept."
             self.done.emit(text, False)
+        except PasswordRejected as e:  # not a bug: ask for the password instead of offering a report
+            print(f"Scan failed: {e}", file=sys.stderr)
+            self.password_asked = True
+            self.status.emit("The scanner did not accept its password.")
+            self.done.emit("", False)
+            self.password_needed.emit(str(e))
         except OSError as e:
             self.last_traceback = traceback.format_exc()
             print(self.last_traceback, file=sys.stderr, end="")
@@ -351,6 +375,7 @@ class Document:
 class MainWindow(QMainWindow):
     request_scan = Signal(object)
     request_connect = Signal()
+    request_password = Signal(str)
     reachable_checked = Signal(bool)  # result of the check at startup (from a background thread)
 
     def __init__(
@@ -545,6 +570,8 @@ class MainWindow(QMainWindow):
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.done.connect(self.scan_done)
         self.worker.button.connect(self.panel_scan)
+        self.worker.password_needed.connect(self.ask_password)
+        self.request_password.connect(self.worker.set_password)
         self.reachable_checked.connect(self._reachable_checked)
         self.scan_thread.finished.connect(self.worker.deleteLater)
         self.scan_thread.start()
@@ -806,6 +833,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Scanner: {self.worker.ip}")
         self.request_connect.emit()
         return True
+
+    @Slot(str)
+    def ask_password(self, reason: str) -> None:
+        """The scanner rejected its password: ask for it; the worker saves it and connects again."""
+        password, ok = QInputDialog.getText(
+            self,
+            "Scanner Password",
+            f"The scanner did not accept the connection:\n{reason}.\n\n"
+            "Scanner Wi-Fi password (saved on this computer):",
+            QLineEdit.EchoMode.Password,
+        )
+        if ok and password:
+            self.request_password.emit(password)
+        else:
+            self.statusBar().showMessage("No scanner password entered: not connected.")
 
     def check_scanner(self) -> None:
         """At startup: without a saved or reachable IP, show the scanner dialog first.

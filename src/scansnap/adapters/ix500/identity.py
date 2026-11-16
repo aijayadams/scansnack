@@ -75,3 +75,14 @@ def load_or_create(path: Path = DEFAULT_PATH, host_id: str | None = None, mac: b
     with os.fdopen(fd, "w") as f:
         json.dump({"host_id": ident.host_id.hex(), "mac": ident.mac.hex(), "host_port": ident.host_port}, f, indent=2)
     return ident
+
+
+def save_password(path: Path, password: str) -> None:
+    """Stores the scanner password in the identity file (created by :func:`load_or_create`)."""
+    d = json.loads(path.read_text())
+    d["password"] = password
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+    tmp.replace(path)

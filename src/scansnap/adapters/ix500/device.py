@@ -6,6 +6,7 @@ import io
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image
@@ -14,9 +15,17 @@ from ...core.images import process
 from ...core.model import ScanSettings, Sheet
 from ...core.report import DeviceDiagnostics
 from . import wire
-from .control import IN_USE, Control, HostIdentity, RegistrationError, default_password
+from .control import (
+    IN_USE,
+    Control,
+    HostIdentity,
+    RegistrationError,
+    WrongPassword,
+    default_password,
+    registration_error,
+)
 from .discovery import Heartbeat, ScannerInfo, discover, local_ip_for
-from .identity import DEFAULT_PATH, load_or_create, local_mac
+from .identity import DEFAULT_PATH, load_or_create, local_mac, save_password
 from .notify import BUTTON, POWER_OFF, POWER_ON, STARTUP_PORT, Listener, Notification
 from .scanner import DPIS, Multifeed, Scanner, release
 from .scsi import ScsiChannel, ScsiError
@@ -26,6 +35,13 @@ PAPER_POLL = 0.25  # the iX1500's interval (docs/protocol-ix1500.md); ScanSnap H
 POLL_RETRY = 1.0  # after a failed C2
 POLL_FAILURES = 4  # failed C2 in a row that end the session (scanner gone without a power-off notice)
 FEEDER_EMPTY = 0x80  # C2 byte 3: 0x80 with an empty feeder, 0 with paper (live 2026-10-30)
+
+
+def serial_in_name(name: str) -> bool:
+    """Whether the discovery name looks like the factory name ``iX500-<serial>``, the source of the
+    factory password. UNVERIFIED: that a scanner renamed in ScanSnap Home announces its new name."""
+    model, dash, serial = name.rpartition("-")
+    return bool(dash and model and len(serial) >= 4 and serial[-4:].isdigit())
 
 
 def nearest_dpi(dpi: int) -> int:
@@ -92,7 +108,8 @@ class Device:
         fields |= {
             "Registered": str(self._registered),
             "Last step": self.stage,
-            "Password": "set" if self.password or (ident and ident.password) else "factory default",
+            # not "Password: …": the report removes whatever follows that
+            "Password source": self._password_source(),
             "Paired with another host": str(
                 bool(info and ident and info.paired_host_id and info.paired_host_id != ident.host_id.hex())
             ),
@@ -160,19 +177,54 @@ class Device:
                 return found[0]
         raise ConnectionError(f"no iX500 answers at {self.ip}")
 
+    def _saved_password(self) -> str | None:
+        """Entered (option or identity file) password; an explicit "" means the scanner has none."""
+        return next((p for p in (self.password, self.ident and self.ident.password) if p is not None), None)
+
+    def _password_source(self) -> str:
+        if self._saved_password() is not None:
+            return "entered"
+        if self.info and not serial_in_name(self.info.name):
+            return "factory default, but the scanner name has no serial number"
+        return "factory default"
+
+    def set_password(self, password: str) -> None:
+        """``ports.scanner.PasswordProtected``: kept in the identity file; the next connect registers with it."""
+        self.password = password
+        if self.ident is not None:
+            self.ident = replace(self.ident, password=password)
+        if self.identity_path.exists():
+            save_password(self.identity_path, password)
+        self._registered = False
+
+    def _password_hint(self) -> str:
+        if self._saved_password() is not None:
+            return "The saved scanner password was not accepted. Enter the scanner's current Wi-Fi password"
+        if self.info and not serial_in_name(self.info.name):
+            return (
+                "The scanner's name does not end in its serial number (was it renamed?), so the factory "
+                "password is unknown. Enter the last four digits of the serial number on the scanner's label, "
+                "or the password set in ScanSnap Home or ScanSnap Manager"
+            )
+        return (
+            "The factory password (the last four digits of the serial number) was tried. If the scanner's "
+            "password was changed in ScanSnap Home or ScanSnap Manager, enter that one"
+        )
+
     def _register(self) -> None:
         if self.ident is None:
             raise ConnectionError("not connected")
         self.stage = "discovery"
         self.info = self._discover(self.ident.mac)
-        # an explicit "" means the scanner has no password; None falls back to the factory default
-        password = next((p for p in (self.password, self.ident.password) if p is not None), None)
+        password = self._saved_password()
         if password is None:
             password = default_password(self.info.serial)
         ctl = Control(self.ip, self.ident)
         self.stage = "registering (0x11)"
         try:
             ctl.register(local_ip_for(self.ip), self.info.if_version, password)
+        except WrongPassword as e:
+            raise registration_error(e.status, hint=self._password_hint()) from e
         except RegistrationError as e:
             holder = self.info.paired_ip if self.info.paired_ip not in ("", "0.0.0.0") else None
             if e.status != IN_USE or holder is None:

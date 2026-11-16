@@ -123,7 +123,10 @@ the client sends the 96 B body ScanSnap Home sends.
 
 Password encoding: for each character `c` at position `i`, `"%03d" % (ord(K[i]) + ord(c) + 11)` with
 `K = "pFusCANsNapFiPfu"` (at most 16 characters). The factory password is the last four digits of the
-serial number, which the scanner announces in its discovery name.
+serial number, which the scanner announces in its discovery name. The client derives it from that name
+and asks the user for the password when the scanner answers −2 or −3. UNVERIFIED: whether a scanner
+renamed in ScanSnap Home still announces `iX500-<serial>`; if not, the factory password cannot be derived
+from discovery.
 
 The registration does not write the scanner's host table; on the iX500 that table is only written over
 USB by ScanSnap Home's Wi-Fi setup, and a host ID missing from it is rejected (−7). The client therefore
@@ -233,3 +236,4 @@ product `ScanSnap iX500  `. The serial number is then only in the discovery name
 5. The E6 power-off block: whether byte 1 is minutes and what byte 0 (0x10) means.
 6. The one-byte image index after 128 sheets in one job (the client wraps it at 256).
 7. Discovery state 2: seen only while connected over USB; other meanings unknown.
+8. Whether renaming the scanner changes its discovery name (offset 40) and so hides the serial number.
