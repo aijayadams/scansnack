@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QSettings, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from helpers import jpeg as make_jpeg
 from scansnap.adapters.library.library import Library
@@ -472,14 +472,14 @@ def test_rejected_password_is_asked_for_instead_of_a_report(
     window.worker.locator = FakeLocator(device)
     asked: list[str] = []
 
-    def get_text(_parent: object, _title: str, label: str, *_args: object) -> tuple[str, bool]:
-        asked.append(label)
-        return "4711", True
+    def ask(reason: str, _parent: object = None) -> str:
+        asked.append(reason)
+        return "4711"
 
     def error_box(*_args: object, **_kwargs: object) -> None:
         pytest.fail("a rejected password is no bug")
 
-    monkeypatch.setattr(QInputDialog, "getText", get_text)
+    monkeypatch.setattr(app_main.PasswordDialog, "ask", ask)
     monkeypatch.setattr(app_main.MainWindow, "error_box", error_box)
     no_dialogs(monkeypatch)
     window.worker.password_needed.disconnect(window.ask_password)
@@ -509,3 +509,13 @@ def test_rejected_password_is_asked_for_instead_of_a_report(
     window.worker.scan(app_main.PRESETS[0])
     app().processEvents()
     assert len(pages) == 1  # connected with the entered password
+
+
+def test_password_dialog_puts_the_advice_first() -> None:
+    app()
+    reason = "registration rejected, status -3: wrong Wi-Fi password. Enter the last four digits"
+    dialog = app_main.PasswordDialog(reason)
+    texts = [w.text() for w in dialog.findChildren(app_main.QLabel)]
+    assert "Enter the last four digits." in texts
+    assert "Details: registration rejected, status -3: wrong Wi-Fi password" in texts
+    assert dialog.field.echoMode() == app_main.QLineEdit.EchoMode.Password

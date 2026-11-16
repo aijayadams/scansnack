@@ -39,7 +39,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -197,6 +196,47 @@ class ScanWorker(QObject):
             self.last_traceback = traceback.format_exc()
             print(self.last_traceback, file=sys.stderr, end="")
             self.done.emit(f"Scan failed: {e}", False)
+
+
+class PasswordDialog(QDialog):
+    """Asks for the scanner password after the scanner rejected it (``core.errors.PasswordRejected``)."""
+
+    def __init__(self, reason: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Scanner Password")
+        # "registration rejected, status -3: wrong Wi-Fi password. <what to do>": advice first, details below
+        technical, _, advice = reason.partition(". ")
+        heading = QLabel("<b>The scanner did not accept its Wi-Fi password.</b>")
+        body = QLabel((advice or "Enter the scanner's Wi-Fi password.").rstrip(".") + ".")
+        body.setWordWrap(True)
+        details = QLabel(f"Details: {technical}")
+        details.setWordWrap(True)
+        details.setEnabled(False)  # dimmed
+        self.field = QLineEdit()
+        self.field.setEchoMode(QLineEdit.EchoMode.Password)
+        self.field.setPlaceholderText("Scanner password")
+        show = QCheckBox("Show password")
+        show.toggled.connect(self._show_password)
+        note = QLabel("The password is saved on this computer.")
+        note.setEnabled(False)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Connect")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        for widget in (heading, body, self.field, show, note, details, buttons):
+            layout.addWidget(widget)
+        self.setFixedWidth(460)
+
+    def _show_password(self, on: bool) -> None:
+        self.field.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
+
+    @staticmethod
+    def ask(reason: str, parent: QWidget | None = None) -> str | None:
+        dialog = PasswordDialog(reason, parent)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.field.text() or None
 
 
 class ScannerDialog(QDialog):
@@ -837,14 +877,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def ask_password(self, reason: str) -> None:
         """The scanner rejected its password: ask for it; the worker saves it and connects again."""
-        password, ok = QInputDialog.getText(
-            self,
-            "Scanner Password",
-            f"The scanner did not accept the connection:\n{reason}.\n\n"
-            "Scanner Wi-Fi password (saved on this computer):",
-            QLineEdit.EchoMode.Password,
-        )
-        if ok and password:
+        password = PasswordDialog.ask(reason, self)
+        if password:
             self.request_password.emit(password)
         else:
             self.statusBar().showMessage("No scanner password entered: not connected.")
