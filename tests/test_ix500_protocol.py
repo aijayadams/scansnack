@@ -157,3 +157,12 @@ def test_registration_errors_name_the_known_reasons() -> None:
     assert "in use by another computer (over" in str(control.RegistrationError(-4))
     assert "another computer (192.0.2.7)" in str(control.RegistrationError(-4, holder="192.0.2.7"))
     assert "unknown reason" in str(control.RegistrationError(-1))
+
+
+def test_password_statuses_are_password_errors() -> None:
+    from scansnap.core.errors import PasswordRejected
+
+    for status in (-2, -3):
+        assert isinstance(control.registration_error(status), PasswordRejected)
+    for status in (-4, -7, -1):
+        assert not isinstance(control.registration_error(status), PasswordRejected)

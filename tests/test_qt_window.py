@@ -19,7 +19,7 @@ from scansnap.adapters.library.library import Library
 from scansnap.adapters.qt import window as app_main
 from scansnap.adapters.qt.report import ReportDialog
 from scansnap.core.document import Entry, Preset, ScanPage, thumbnail
-from scansnap.core.errors import FeedError
+from scansnap.core.errors import FeedError, PasswordRejected
 from scansnap.core.fixes import IX1500_PAIRING_CLEANUP, Fixes
 from scansnap.core.model import FoundScanner, ScanSettings, Sheet
 from scansnap.core.report import DeviceDiagnostics
@@ -441,3 +441,81 @@ def test_fixes_menu_switches_a_fix_and_remembers_it(tmp_path: Path) -> None:
 
 def test_no_fixes_menu_without_fixes(window: app_main.MainWindow) -> None:
     assert "Fixes" not in [a.text() for a in window.menuBar().actions()]
+
+
+class PasswordDevice(JamDevice):
+    """Rejects its password until ``set_password`` (``ports.scanner.PasswordProtected``)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.password = ""
+        self.connects = 0
+
+    def set_password(self, password: str) -> None:
+        self.password = password
+
+    def connect(self) -> None:
+        self.connects += 1
+        if self.password != "4711":
+            raise PasswordRejected("registration rejected, status -3: wrong Wi-Fi password")
+
+    def scan(self, settings: ScanSettings, *, whiten: bool = False) -> Iterator[Sheet]:
+        self.connect()
+        yield Sheet(self.page, None, None)
+
+
+def test_rejected_password_is_asked_for_instead_of_a_report(
+    window: app_main.MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = PasswordDevice()
+    window.worker.ip = "192.0.2.5"
+    window.worker.locator = FakeLocator(device)
+    asked: list[str] = []
+
+    def ask(reason: str, _parent: object = None) -> str:
+        asked.append(reason)
+        return "4711"
+
+    def error_box(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("a rejected password is no bug")
+
+    monkeypatch.setattr(app_main.PasswordDialog, "ask", ask)
+    monkeypatch.setattr(app_main.MainWindow, "error_box", error_box)
+    no_dialogs(monkeypatch)
+    window.worker.password_needed.disconnect(window.ask_password)
+    reasons: list[str] = []
+    window.worker.password_needed.connect(reasons.append)
+
+    window.worker.open_connection()
+    window.worker.open_connection()  # the reconnect timer asks only once
+    window.worker.scan(app_main.PRESETS[0])  # a scan asks again
+    app().processEvents()
+    assert len(reasons) == 2 and "wrong Wi-Fi password" in reasons[0]
+
+    sent: list[str] = []
+    window.request_password.disconnect(window.worker.set_password)
+    window.request_password.connect(sent.append)
+    window.ask_password(reasons[0])
+    app().processEvents()
+    assert sent == ["4711"] and "wrong Wi-Fi password" in asked[0]
+    window.worker.set_password(sent[0])
+    assert device.password == "4711" and not window.worker.password_asked
+    pages: list[ScanPage] = []
+
+    def on_page(page: ScanPage, _thumb: bytes) -> None:
+        pages.append(page)
+
+    window.worker.page.connect(on_page)
+    window.worker.scan(app_main.PRESETS[0])
+    app().processEvents()
+    assert len(pages) == 1  # connected with the entered password
+
+
+def test_password_dialog_puts_the_advice_first() -> None:
+    app()
+    reason = "registration rejected, status -3: wrong Wi-Fi password. Enter the last four digits"
+    dialog = app_main.PasswordDialog(reason)
+    texts = [w.text() for w in dialog.findChildren(app_main.QLabel)]
+    assert "Enter the last four digits." in texts
+    assert "Details: registration rejected, status -3: wrong Wi-Fi password" in texts
+    assert dialog.field.echoMode() == app_main.QLineEdit.EchoMode.Password

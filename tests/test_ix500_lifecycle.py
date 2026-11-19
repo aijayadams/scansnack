@@ -464,3 +464,68 @@ def test_dead_listener_is_started_again(tmp_path: Path, monkeypatch: pytest.Monk
     d.connect()
     assert len(created) == 3 and first not in d._listeners  # pyright: ignore[reportPrivateUsage]
     d.disconnect()
+
+
+def _rejecting_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, sent: list[str | None]) -> Device:
+    """Device whose scanner only accepts the password "4711"."""
+    from scansnap.adapters.ix500.control import registration_error
+    from scansnap.adapters.ix500.discovery import ScannerInfo
+
+    class Ctl:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def register(self, _ip: str, _ver: int, password: str | None) -> None:
+            sent.append(password)
+            if password != "4711":
+                raise registration_error(-3)
+
+    info = ScannerInfo("127.0.0.1", 53218, 53219, "", name, "ScanSnap iX500", 6, "", "", name.rpartition("-")[2])
+    monkeypatch.setattr(device_mod, "Control", Ctl)
+    monkeypatch.setattr(device_mod, "local_ip_for", _zero_mac)
+    monkeypatch.setattr(device_mod, "ScsiChannel", _NoChannel)
+    path = tmp_path / "id.json"
+    path.write_text('{"host_id": "0000000000000000", "mac": "020000000001"}')
+    d = Device("127.0.0.1", path)
+    d.ident = IDENT
+
+    def known(_mac: bytes) -> ScannerInfo:
+        return info
+
+    monkeypatch.setattr(d, "_discover", known)
+    return d
+
+
+def test_wrong_password_asks_for_it_and_remembers_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scansnap.adapters.ix500.identity import load_or_create
+    from scansnap.core.errors import PasswordRejected
+    from scansnap.core.report import scrub
+
+    sent: list[str | None] = []
+    d = _rejecting_device(tmp_path, monkeypatch, "iX500-A0XX012345", sent)
+    with pytest.raises(PasswordRejected, match=r"status -3: wrong Wi-Fi password\. The factory password"):
+        d._register()  # pyright: ignore[reportPrivateUsage]
+    assert sent == ["2345"]
+    fields = d.diagnostics().fields
+    assert fields["Password source"] == "factory default"
+    assert "Password source: factory default" in scrub("Password source: factory default")
+
+    d.set_password("4711")
+    d._register()  # pyright: ignore[reportPrivateUsage]
+    assert sent[-1] == "4711" and d.connected
+    assert d.diagnostics().fields["Password source"] == "entered"
+    assert load_or_create(tmp_path / "id.json").password == "4711"  # kept for the next start
+
+    d.set_password("0000")
+    with pytest.raises(PasswordRejected, match="saved scanner password was not accepted"):
+        d._register()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_renamed_scanner_explains_the_unknown_factory_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scansnap.core.errors import PasswordRejected
+
+    d = _rejecting_device(tmp_path, monkeypatch, "Office scanner", [])
+    with pytest.raises(PasswordRejected, match="does not end in its serial number"):
+        d._register()  # pyright: ignore[reportPrivateUsage]
+    assert d.diagnostics().fields["Password source"] == "factory default, but the scanner name has no serial number"
+    assert device_mod.serial_in_name("iX500-A0XX012345") and not device_mod.serial_in_name("iX500-Office")

@@ -17,3 +17,7 @@ class FeedError(ScanError):
     def __init__(self, reason: str, detail: str = ""):
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
+
+
+class PasswordRejected(ScanError):
+    """The scanner refused this computer because the password it needs is missing or wrong."""

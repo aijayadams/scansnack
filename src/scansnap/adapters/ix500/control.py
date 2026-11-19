@@ -11,6 +11,7 @@ import socket
 import struct
 from dataclasses import dataclass
 
+from ...core.errors import PasswordRejected
 from . import wire
 
 CONTROL_PORT = 53219
@@ -20,11 +21,11 @@ SCANNER_TIMEOUT = 0x1E  # sent by ScanSnap Home in every registration
 PASSWORD_KEY = "pFusCANsNapFiPfu"
 
 
-IN_USE = -4
+NO_PASSWORD, WRONG_PASSWORD, IN_USE = -2, -3, -4
 # Seen live; UNVERIFIED: the other negative statuses.
 REGISTRATION_STATUS = {
-    -2: "the scanner wants its Wi-Fi password",
-    -3: "wrong Wi-Fi password",
+    NO_PASSWORD: "the scanner wants its Wi-Fi password",
+    WRONG_PASSWORD: "wrong Wi-Fi password",
     IN_USE: "the scanner is in use by another computer (over Wi-Fi or USB). "
     "Quit ScanSnap Home there or unplug the scanner's USB cable, then restart the scanner and try again",
     -7: "this host ID is not paired with the scanner (pairing is done over USB)",
@@ -32,14 +33,23 @@ REGISTRATION_STATUS = {
 
 
 class RegistrationError(Exception):
-    def __init__(self, status: int, holder: str | None = None):
-        """``holder``: IP of the host the scanner reports as registered, if known."""
+    def __init__(self, status: int, holder: str | None = None, hint: str = ""):
+        """``holder``: IP of the host the scanner reports as registered, if known. ``hint``: what to do."""
         reason = REGISTRATION_STATUS.get(status, "unknown reason")
         if status == IN_USE and holder:
             reason = reason.replace("another computer", f"another computer ({holder})", 1)
-        super().__init__(f"registration rejected, status {status}: {reason}")
+        super().__init__(f"registration rejected, status {status}: {reason}" + (f". {hint}" if hint else ""))
         self.status = status
         self.holder = holder
+
+
+class WrongPassword(RegistrationError, PasswordRejected):
+    """Statuses -2 and -3: the scanner wants its Wi-Fi password, or a different one."""
+
+
+def registration_error(status: int, holder: str | None = None, hint: str = "") -> RegistrationError:
+    cls = WrongPassword if status in (NO_PASSWORD, WRONG_PASSWORD) else RegistrationError
+    return cls(status, holder, hint)
 
 
 @dataclass(frozen=True)
@@ -113,7 +123,7 @@ class Control:
             raise wire.ProtocolError(f"short registration reply {frame.hex()}")
         status = struct.unpack_from(">i", frame, 8)[0]
         if status != 0:
-            raise RegistrationError(status)
+            raise registration_error(status)
 
     def device_name(self) -> str:
         frame = self._call(0x13)
