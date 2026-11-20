@@ -200,7 +200,8 @@ class ScanWorker(QObject):
             else:
                 text = FEED_HELP.get(e.reason, f"The scanner reported a paper problem ({e.reason}).")
             if count:
-                text += f"\n\nThe {count} page(s) scanned before are kept."
+                kept = "scanned" if self._held is not None else "scanned before"  # may include a saved double feed
+                text += f"\n\nThe {count} page(s) {kept} are kept."
             self.done.emit(text, False)
         except PasswordRejected as e:  # not a bug: ask for the password instead of offering a report
             print(f"Scan failed: {e}", file=sys.stderr)

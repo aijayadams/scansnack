@@ -558,7 +558,10 @@ Each item corresponds to an `# UNVERIFIED:` marker in the code (location in pare
     icon ids 73, 75–82 and from 84 on were not written; why ScanSnap Home sent no 0x0610 for a panel press
     (one capture); what 0x0200 returns before any profile was tapped.
 19. **A jam reported by E0** (`scanner.Scanner.scan`): every captured jam ended a read; whether ScanSnap
-    Home holds the batch after E0's 3/80/01 too is not known, so our client ends it.
+    Home holds the batch after E0's 3/80/01 too is not known, so our client ends it. Live with our client:
+    a sheet held back before it was picked up gave 3/80/01 on E0, and the panel showed nothing after D6; a
+    sheet held back once it was moving was read normally, the panel showed a jam, and the next E0 reported
+    only 3/80/03 (feeder empty), so the host was not told about that jam.
 20. **The double-fed image after "Scan" on the panel** (`scanner.Scanner.scan`): whether ScanSnap Home keeps
     it is not visible in the traffic; our client drops it unless `keep_double_feed` is set.
 21. **How long a batch can be held** (`scanner.Scanner._hold`): the longest captured hold lasted about 33 s;
