@@ -11,6 +11,12 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 
 ### Added
 
+- iX1500 (library only; the app, CLI and AirScan bridge are unchanged): a computer can have several touch
+  panel profiles, each with its own icon and colour, and can ask which one was tapped for a press. The
+  Scan button listener can be kept across disconnects, and the client can be told when the scanner has
+  powered on.
+- iX1500 protocol notes: which profile was tapped (0x0200), and the touch panel's profile icons and
+  colours.
 - iX1500 protocol notes: the boot notice, and button notifications after the session has closed.
 
 ### Changed

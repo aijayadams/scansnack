@@ -5,7 +5,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from scansnap.adapters.ix1500.button import ButtonListener, Notification, parse_notification
+from scansnap.adapters.ix1500.button import BootListener, ButtonListener, Notification, parse_notification
 
 # As in the capture (counter 0x20)
 NOTIFY = bytes.fromhex("0000003073734e52000000010000000020000000c0a8b21d020000000002") + b"\0" * 18
@@ -51,6 +51,32 @@ BOOT = NOTIFY[:8] + b"\0\0\0\x21" + NOTIFY[12:16] + b"\x01" + NOTIFY[17:]
 
 def test_boot_notice_is_not_a_button_notification() -> None:
     assert parse_notification(BOOT) is None
+
+
+def test_boot_listener_fires_once_per_notice_from_the_scanner() -> None:
+    got: list[int] = []
+    listener = BootListener("127.0.0.1", lambda: got.append(len(got)), port=0)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            target = ("127.0.0.1", listener.port)
+            for _ in range(6):  # three times to the host and three times as a broadcast
+                s.sendto(BOOT, target)
+            s.sendto(NOTIFY, target)  # a button notification is not a boot notice
+            s.sendto(b"junk", target)
+            s.sendto(BOOT[:16] + b"\x02" + BOOT[17:], target)  # the next notice marks the end
+            assert wait_until(lambda: len(got) >= 2)
+    finally:
+        listener.close()
+    assert got == [0, 1]
+
+    fired = threading.Event()
+    listener = BootListener("192.0.2.1", fired.set, port=0)  # another scanner
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(BOOT, ("127.0.0.1", listener.port))
+        assert not fired.wait(0.5)
+    finally:
+        listener.close()
 
 
 def test_repeat_window() -> None:

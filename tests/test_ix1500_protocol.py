@@ -12,10 +12,12 @@ from scansnap.adapters.ix1500 import discovery, wire
 from scansnap.adapters.ix1500.control import (
     SUB_ANNOUNCE,
     SUB_SET_PROFILES,
+    SUB_TAPPED_PROFILE,
     Control,
     HostIdentity,
     json_body,
     parse_json_response,
+    plan_own_profiles,
     register_body,
 )
 from scansnap.adapters.ix1500.discovery import ScannerInfo, parse_reply
@@ -349,3 +351,74 @@ def test_paper_jam_keeps_earlier_pages_and_releases_session() -> None:
         assert mock.received[-1][0][0] == 0xD6
     finally:
         mock.close()
+
+
+def test_plan_own_profiles_keeps_ids() -> None:
+    ids = iter(["NEW1", "NEW2"])
+    base = {"icon_id": 1, "prof_name": "template"}
+    out = plan_own_profiles(
+        [{"prof_id": "OLD", "prof_name": "scansnap-bridge"}], ["A", "B"], base, 5, lambda: next(ids)
+    )
+    assert [(p["prof_name"], p["prof_id"], p["disp_order"], p["icon_id"]) for p in out] == [
+        ("A", "OLD", 5, 1),
+        ("B", "NEW1", 6, 1),
+    ]
+    mine = [{"prof_id": "2", "prof_name": "B"}, {"prof_id": "1", "prof_name": "A"}]
+    assert [p["prof_id"] for p in plan_own_profiles(mine, ["A", "B"], base, 1)] == ["1", "2"]
+    with pytest.raises(ValueError, match="unique"):
+        plan_own_profiles([], ["A", "A"], base, 1)
+    looks = plan_own_profiles([], ["A", "B"], dict(base, color_id=2), 1, lambda: "N", {"B": 83}, {"A": 6})
+    assert [(p["icon_id"], p["color_id"]) for p in looks] == [(1, 6), (83, 2)]
+
+
+def test_claim_with_profile_names_writes_one_profile_per_name() -> None:
+    ident = HostIdentity("scansnap-bridge", "8ff7d20fae1b79f6", "OWNUSER", bytes(6))
+    other_prof = {"user_id": "OTHER", "prof_id": "X", "disp_order": 3}
+    current: dict[str, Any] = {
+        "conn_user": {"users": [], "select": {"id": ident.host_id, "kind": 1}},
+        "profiles": [other_prof, {"user_id": "OWNUSER", "prof_id": "KEEP", "prof_name": "scansnap-bridge"}],
+        "version": 3,
+    }
+    payload = RecordingControl(ident, current).claim("192.168.178.37", ["Work", "Home"])
+    other, a, b = payload["profiles"]
+    assert other == other_prof
+    assert (a["prof_name"], a["prof_id"], a["disp_order"]) == ("Work", "KEEP", 4)
+    assert (b["prof_name"], b["disp_order"]) == ("Home", 5) and len(b["prof_id"]) == 32
+    assert a["user_id"] == b["user_id"] == "OWNUSER" and b["host_address"] == "192.168.178.37"
+
+
+class TappedControl(RecordingControl):
+    def __init__(self, reply: Any):
+        super().__init__(HostIdentity("t", "0f1e2d3c4b5a6978", "U", bytes(6)))
+        self.reply = reply
+
+    def json_call(self, sub: int, payload: Any | None = None) -> Any:
+        super().json_call(sub, payload)
+        return self.reply
+
+
+def test_tapped_profile() -> None:
+    ctl = TappedControl({"profiles": [{"prof_id": "P", "prof_name": "Home"}], "version": 3})
+    assert ctl.tapped_profile() == {"prof_id": "P", "prof_name": "Home"}
+    assert ctl.payloads == [(SUB_TAPPED_PROFILE, None)]
+    assert TappedControl({"profiles": [], "version": 3}).tapped_profile() is None
+    assert TappedControl(0).tapped_profile() is None
+
+
+def test_claim_sets_the_user_color() -> None:
+    ident = HostIdentity("scansnap-bridge", "8ff7d20fae1b79f6", "OWNUSER", bytes(6))
+    current: dict[str, Any] = {
+        "conn_user": {"users": [], "select": {"id": ident.host_id, "kind": 1}},
+        "profiles": [],
+        "version": 3,
+    }
+    default = RecordingControl(ident, current).claim("192.168.178.37")
+    blue = RecordingControl(ident, current).claim("192.168.178.37", user_color=6)
+    assert default["conn_user"]["users"][-1]["color_id"] == 2
+    assert blue["conn_user"]["users"][-1]["color_id"] == 6
+    assert blue["profiles"][0]["color_id"] == 2  # profiles keep their own colour
+
+
+def test_tapped_profile_request_matches_capture() -> None:
+    # 0x0200 as ScanSnap Home sent it (private double-feed capture): sub-command, no JSON
+    assert json_body(0x0200, None).hex() == "00000010" + "0200" + "00" * 10 + "00000000"

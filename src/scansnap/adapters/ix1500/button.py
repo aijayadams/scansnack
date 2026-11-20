@@ -1,7 +1,7 @@
 """Scan button on the touch panel: UDP notification to ``host_port`` of the selected host.
 
-Layout: docs/protocol-ix1500.md, section "Scan button on the touch panel". Only the UDP notification is evaluated
-(C2 can miss the short pulse).
+Layout: docs/protocol-ix1500.md, sections "Scan button on the touch panel" and "Boot notice". Only the UDP
+notification is evaluated (C2 can miss the short pulse). :class:`BootListener` handles the boot notice (UDP 53220).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..scansnap_wifi import notify
 from ..scansnap_wifi.notify import REPEAT_WINDOW
 from . import wire
 from .wire import MAGIC
@@ -96,3 +97,27 @@ class ButtonListener:
         self._stop.set()
         self._thread.join(2)
         self.sock.close()
+
+
+BOOT_PORT = 53220
+EVENT_BOOT = 0x21
+
+
+class BootListener(notify.Listener):
+    """Calls ``callback`` once per boot notice (event 0x21 on UDP 53220) from the scanner.
+
+    The iX1500 sent it after power-on (reboot capture: three times, to the host and as a broadcast). A host
+    holding a persistent session can reconnect as soon as it arrives.
+    """
+
+    # UNVERIFIED: only the power-on notice has been captured; a notice after waking from deep sleep was seen
+    # live but not captured. Event 0x30 on the same port after profile writes is ignored; its meaning is not
+    # known.
+
+    def __init__(self, scanner_ip: str, callback: Callable[[], None], port: int = BOOT_PORT):
+        def on_notice(note: notify.Notification) -> None:
+            if note.event == EVENT_BOOT:
+                callback()
+
+        super().__init__(scanner_ip, port, on_notice, magic=MAGIC)
+        self.port = self.sock.getsockname()[1]  # the bound port, also when ``port`` is 0

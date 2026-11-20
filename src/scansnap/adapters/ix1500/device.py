@@ -6,7 +6,8 @@ import contextlib
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from typing import Any, cast
 
 from ...core.fixes import Fixes
 from ...core.images import process
@@ -133,7 +134,8 @@ class Device:
 
     ``on_button`` is called (in the listener thread) when "Scan" is pressed on the touch panel. The caller then
     starts :meth:`scan` as usual. The listener opens before the session, since the scanner can send a press
-    while the session is still opening (docs/protocol-ix1500.md, "Boot notice").
+    while the session is still opening (docs/protocol-ix1500.md, "Boot notice"). With
+    ``keep_button_listener`` it also stays open across :meth:`disconnect` and reconnects, until :meth:`close`.
     """
 
     def __init__(
@@ -146,6 +148,7 @@ class Device:
         crop: bool = True,
         keep_alive: bool = False,
         on_button: Callable[[Notification], None] | None = None,
+        keep_button_listener: bool = False,
         fixes: Fixes | None = None,
     ):
         # The scanner delivers the pages rotated by 180° (live test 2026-10-29, front and back)
@@ -155,6 +158,7 @@ class Device:
         self.fixes = fixes or Fixes()
         self.ctl = Control(ip, ident, fixes=self.fixes)
         self.on_button = on_button
+        self.keep_button_listener = keep_button_listener
         self._session: Session | None = None
         self._button: ButtonListener | None = None
         self.stage = "idle"  # last step started, for error reports
@@ -185,7 +189,8 @@ class Device:
         try:
             self._live_session()
         except BaseException:
-            self._stop_button_listener()
+            if not self.keep_button_listener:
+                self._stop_button_listener()
             raise
 
     def _live_session(self) -> Session:
@@ -214,8 +219,14 @@ class Device:
             self._button.close()
             self._button = None
 
-    def disconnect(self) -> None:
+    def close(self) -> None:
+        """End the session and stop the button listener, also with ``keep_button_listener``."""
+        self.disconnect()
         self._stop_button_listener()
+
+    def disconnect(self) -> None:
+        if not self.keep_button_listener:
+            self._stop_button_listener()
         self._close_session()
 
     def _close_session(self) -> None:
@@ -223,21 +234,50 @@ class Device:
             self._session.close()
             self._session = None
 
-    def ensure_profile(self) -> None:
-        """Creates a user + our own profile if the scanner does not return one.
+    def ensure_profile(
+        self,
+        names: Sequence[str] | None = None,
+        icons: Mapping[str, int] | None = None,
+        colors: Mapping[str, int] | None = None,
+        user_color: int | None = None,
+    ) -> bool:
+        """Creates a user + our own profile(s) if the scanner does not return them. True if it had to.
+
+        Without ``names`` any profile of ours will do. With ``names`` our profiles must be exactly those
+        (one touch panel button each, in any order), with ``icon_id``/``color_id`` from ``icons``/``colors``,
+        and our user entry with ``user_color`` if given;
+        otherwise they are rewritten, keeping existing ids (see :func:`control.plan_own_profiles`).
+        Rewriting drops a persistent session; :meth:`scan` and :meth:`connect` open a new one.
 
         The scanner occasionally loses its profiles (e.g. after switching users on the panel).
         """
         # UNVERIFIED: the cause of profiles disappearing without a user switch is unknown.
         self.stage = "reading profiles (0x0100)"
-        profiles = self.ctl.get_users().get("profiles", [])
-        if any(p.get("user_id") == self.ident.user_id for p in profiles):
-            return
-        print("No profile of our own on the scanner – running claim", file=sys.stderr)
+        users = self.ctl.get_users()
+        profiles = users.get("profiles", [])
+        conn_user = cast("dict[str, Any]", users.get("conn_user") or {})
+        conn_users = cast("list[dict[str, Any]]", conn_user.get("users") or [])
+        me = [u for u in conn_users if u.get("host_id") == self.ident.host_id]
+        user_ok = user_color is None or (bool(me) and me[0].get("color_id") == user_color)
+        own = [p for p in profiles if p.get("user_id") == self.ident.user_id]
+        have = sorted(p.get("prof_name") or "" for p in own)
+
+        def matches(key: str, wanted: Mapping[str, int] | None) -> bool:
+            want = dict(wanted or {})
+            return all(p.get(key) == want[str(p.get("prof_name"))] for p in own if str(p.get("prof_name")) in want)
+
+        looks_ok = matches("icon_id", icons) and matches("color_id", colors)
+        if own and user_ok and looks_ok and (names is None or have == sorted(names)):
+            return False
+        if names is None and icons is None and colors is None and user_color is None:
+            print("No profile of our own on the scanner – running claim", file=sys.stderr)  # as before
+        else:
+            print("Profiles of our own on the scanner missing or different – running claim", file=sys.stderr)
         self.stage = "pairing (claim)"
         self.disconnect()  # pairing needs a connection sequence of its own
         with session(self.ctl, self.ip, self.ident, pair=True):
-            self.ctl.claim(self.ctl.local_ip())
+            self.ctl.claim(self.ctl.local_ip(), names, icons, colors, user_color)
+        return True
 
     def scan(
         self,

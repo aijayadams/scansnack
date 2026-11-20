@@ -1,7 +1,8 @@
 """Persistent session (Device with keep_alive): one connection for several scans, reconnect after a drop."""
 
+import contextlib
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from typing import Any, ClassVar
 
 import pytest
@@ -165,6 +166,22 @@ def test_button_listener_follows_session(fake_sessions: Sessions, monkeypatch: p
     dev.disconnect()
 
 
+def test_kept_button_listener_survives_reconnects(fake_sessions: Sessions, monkeypatch: pytest.MonkeyPatch) -> None:
+    listeners: list[FakeListener] = []
+    monkeypatch.setattr(FakeListener, "created", listeners)
+    monkeypatch.setattr(device, "ButtonListener", FakeListener)
+    dev, _ = make_device()
+    dev.on_button = ignore_press
+    dev.keep_button_listener = True
+    dev.connect()
+    dev.disconnect()
+    assert len(listeners) == 1 and not listeners[0].closed
+    dev.connect()  # reconnect: same listener
+    assert len(listeners) == 1
+    dev.close()
+    assert listeners[0].closed
+
+
 def test_button_listener_opens_before_the_session(fake_sessions: Sessions, monkeypatch: pytest.MonkeyPatch) -> None:
     order: list[str] = []
 
@@ -192,7 +209,9 @@ def ignore_press(note: Notification) -> None:
     pass
 
 
-def test_listener_closed_when_session_fails(fake_sessions: Sessions, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_listener_closed_when_session_fails_unless_kept(
+    fake_sessions: Sessions, monkeypatch: pytest.MonkeyPatch
+) -> None:
     listeners: list[FakeListener] = []
     monkeypatch.setattr(FakeListener, "created", listeners)
     monkeypatch.setattr(device, "ButtonListener", FakeListener)
@@ -201,11 +220,15 @@ def test_listener_closed_when_session_fails(fake_sessions: Sessions, monkeypatch
         raise OSError("no route to host")
 
     monkeypatch.setattr(device.Session, "open", fail)
-    dev, _ = make_device()
-    dev.on_button = ignore_press
-    with pytest.raises(OSError):
-        dev.connect()
-    assert listeners[-1].closed
+    for keep in (False, True):
+        dev, _ = make_device()
+        dev.on_button = ignore_press
+        dev.keep_button_listener = keep
+        with pytest.raises(OSError):
+            dev.connect()
+        assert listeners[-1].closed is not keep
+        dev.close()
+        assert listeners[-1].closed
 
 
 def test_reconnect_keeps_the_button_listener(fake_sessions: Sessions, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,3 +282,45 @@ def test_connect_restores_a_missing_listener(fake_sessions: Sessions, monkeypatc
     dev.connect()  # the session is still alive
     assert len(listeners) == 2
     dev.disconnect()
+
+
+class ProfileControl(FakeControl):
+    def __init__(self, names: list[str]) -> None:
+        super().__init__()
+        self.names = names
+        self.claimed: list[Any] = []
+
+    def get_users(self) -> dict[str, Any]:
+        return {
+            "conn_user": {"users": [{"host_id": IDENT.host_id, "color_id": 2}]},
+            "profiles": [{"user_id": IDENT.user_id, "prof_name": n, "icon_id": 1, "color_id": 2} for n in self.names],
+        }
+
+    def claim(
+        self, host_ip: str, profile_names: Any = None, icons: Any = None, colors: Any = None, user_color: Any = None
+    ) -> dict[str, Any]:
+        self.claimed.append(profile_names)
+        return {}
+
+
+def test_ensure_profile_rewrites_only_when_names_differ(monkeypatch: pytest.MonkeyPatch) -> None:
+    @contextlib.contextmanager
+    def no_session(*args: Any, **kwargs: Any) -> Generator[None]:
+        yield
+
+    monkeypatch.setattr(device, "session", no_session)
+    dev, _ = make_device()
+    ctl = dev.ctl = ProfileControl(["B", "A"])
+    assert dev.ensure_profile(["A", "B"]) is False and ctl.claimed == []
+    assert dev.ensure_profile() is False
+    assert dev.ensure_profile(["A", "B"], {"A": 1}, {"B": 2}) is False
+    assert dev.ensure_profile(["A", "B"], None, {"B": 6}) is True
+    assert dev.ensure_profile(["A", "B"], user_color=2) is False
+    assert dev.ensure_profile(["A", "B"], user_color=6) is True
+    assert dev.ensure_profile(None, {"A": 74}) is True  # icons alone are compared too
+    ctl.claimed.clear()
+    assert dev.ensure_profile(["A", "B"], {"A": 74}) is True and ctl.claimed == [["A", "B"]]
+    ctl.claimed.clear()
+    assert dev.ensure_profile(["A", "C"]) is True and ctl.claimed == [["A", "C"]]
+    ctl.names = []
+    assert dev.ensure_profile() is True and ctl.claimed[-1] is None

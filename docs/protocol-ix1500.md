@@ -32,6 +32,7 @@ Fujitsu. See the [disclaimer](disclaimer.md).
   - [Sense codes](#sense-codes)
 - [Scan button on the touch panel](#scan-button-on-the-touch-panel)
 - [Boot notice (UDP 53220)](#boot-notice-udp-53220)
+- [Profile icons](#profile-icons)
 - [Sequences](#sequences)
   - [App start / connect](#app-start--connect)
   - [Scan](#scan)
@@ -59,7 +60,10 @@ capture is public, it is an anonymised extract without image data, generated wit
 | Live test logs | our own client against the device: keep-alive, scan, `claim` | no |
 | User list backup | the scanner's user and profile list before our changes | no |
 | Reboot capture | our own client: scanner power cycle, then a press on the panel | no |
-| Session capture | our own client: presses after the session was closed, profile writes (0x0110) | no |
+| Session capture | our own client: presses after the session was closed, profile writes (0x0110), a profile rename, profile writes with `icon_id` 1–72 and 74/83 and `color_id` 0–9 | no |
+| Double-feed capture | ScanSnap Home: Scan pressed on the panel (profile with automatic color mode and resolution), one sheet that double-fed | no |
+| Profiles capture | our own client with two profiles of its own: presses on each | no |
+| Panel photos | the touch panel showing the profiles written in the session capture | no |
 
 Live tests ran on a home network with ScanSnap Home quit.
 
@@ -75,7 +79,7 @@ Conventions: offsets are byte offsets from the start of the frame or body; integ
 | Control channel | TCP 53219 | registration, users/profiles (JSON), one connection per command | `control.py` |
 | Scan channel | TCP 53218 | SCSI tunnel, persistent connection | `scsi.py`, `scanner.py` |
 | Scan button | UDP `host_port` (host; 55265 in our setup) | "Scan" pressed on the touch panel | `button.py` |
-| Boot notice | UDP 53220 (host) | event 0x21 after power-on; event 0x30 after each accepted 0x0110 (meaning not known) | – |
+| Boot notice | UDP 53220 (host) | event 0x21 after power-on; event 0x30 after each accepted 0x0110 (meaning not known) | `button.BootListener` |
 
 No TLS, no cryptography.
 
@@ -196,6 +200,7 @@ u32 status at offset 24 (0 = ok).
 |---|---|
 | 0x0100 | read users (`conn_user.users`, `conn_user.select`) and profiles |
 | 0x0110 | write users/profiles |
+| 0x0200 | profile tapped on the touch panel for the last "Scan" (no JSON in the request; reply `{"profiles": [<one profile>], "version": 3}`) |
 | 0x0210 | announce host (`host_address`, `function_level` 2, `current_user_id`, `host_port`, `version` 1) |
 | 0x0610 | select profile (`{"version": 1, "prof_id": …}`) |
 | 0x0810 | scan settings for the touch panel |
@@ -332,8 +337,39 @@ subnet's directed broadcast, with the button notification's layout (and the iX50
 In the same capture the button notification for a press arrived 1.1 s after the boot notice, while the
 host was still opening its session (0x11 answered 2.4 s after the notice); the host was not yet listening
 (ICMP port unreachable). A host therefore has to listen on its `host_port` while it opens the session.
-`Device` opens its button listener before the session and keeps it across its own reconnects. Repeats are
-recognised by counter within 3 s, as the counter restarts after power-on.
+`Device` opens its button listener before the session and keeps it across its own reconnects; with
+`keep_button_listener=True` also across `disconnect()`. Repeats are recognised by counter within 3 s, as
+the counter restarts after power-on. `button.BootListener` reports each boot notice once.
+
+After the notification ScanSnap Home asks which profile was tapped with 0x41/0x0200 (65 ms later in the
+double-feed capture); the notification itself does not say. In that capture it then sent 0x0100 and D5,
+without 0x0610. With several profiles for the host (one touch panel button each, see
+[`claim`](#creating-our-own-user-and-profile-claim)) this tells the host which button was used: in the
+profiles capture a client built on this library had two profiles and sent 0x0610 with the `prof_id` that
+0x0200 returned after each press. The reply is the
+profile as it was when tapped: in the session capture 0x0200 still returned the old name 10 s after 0x0110
+renamed it, and the new name after the next tap and press (the panel showed the new name at once).
+
+## Profile icons
+
+A profile's `icon_id` picks the round icon on its touch panel button and `color_id` its colour (session
+capture for the writes, panel photos for what they showed). A write with `color_id` 1–8 was accepted;
+writes with 0–9 and with 1–9 failed with `0xffffffff`, so 9 is rejected (0 was not tested alone).
+Colours: 1 sky blue, 2 red, 3 yellow, 4 green, 5 cyan, 6 blue, 7 purple, 8 pink. `icon_id` values written
+and accepted: 1–72, 74 and 83:
+
+| `icon_id` | Icon |
+|---|---|
+| 1–12 | star, contact card, envelope, group of people, airplane, page with "e", folder, A3 page, page with folded corner, person with plus, house with dollar sign, photo album |
+| 13–24 | notepad, school, open book, booklet, calendar, notebook with leaf, fork and knife, open book with text, ScanSnap Cloud, cloud upload, picture, receipt |
+| 25–36 | coins, notebook with dollar sign, baby, balloon, beer mug, light bulb, briefcase, car, cat, tick, paper clip, coffee cup |
+| 37–48 | speech bubble, monkey, flame, card, gift, heart, house, hospital, padlock, girl, moon, music note |
+| 49–55 | pencil, rosette, shopping basket, sun, waste bin, ghost, grid |
+| 56–65 | digits 0–9 |
+| 66– | letters A, B, C, …; seen up to 72 (G), and 74 (I) and 83 (R) |
+
+`control.plan_own_profiles` takes the icon and colour per profile name. The host's own entry in the user
+list also has a `color_id`, which colours the icon in the panel's title bar (`claim(user_color=…)`).
 
 ## Sequences
 
@@ -353,7 +389,8 @@ Confirmed live (private keep-alive log): session held for 12 s, then two scans o
 ### Scan
 
 0x0100 (get_users) → 0x0610 (select profile) → D5 … on the scan channel, ~100–150 ms apart.
-Stop C2 polling before D5 and resume it after D6.
+Stop C2 polling before D5 and resume it after D6. For a press on the touch panel the double-feed capture
+has 0x0200 → 0x0100 → D5 instead, without 0x0610 (see [Scan button](#scan-button-on-the-touch-panel)).
 
 - D5 without a preceding 0x0610 → sense 3/80/33.
 - Live scan works (private scan log): valid JPEG 2608×3688 RGB, color/300.
@@ -380,6 +417,10 @@ Confirmed in private live test logs of `claim` and a subsequent scan:
 If step 4 is skipped after an error in steps 2–3, the scanner stays in the pairing state and the touch
 panel shows "Processing" until it is switched off (user report, [issue #19](https://github.com/elte0/scansnack/issues/19)).
 With the opt-in fix *#19* (app menu *Fixes*) our client runs step 4 after every error.
+
+`claim` can write several profiles of ours at once (`profile_names`; one touch panel button each):
+profiles keep their `prof_id` by name, and a renamed profile keeps the id of the one it replaces.
+Confirmed live with two profiles; see 0x0200 for telling them apart after a press.
 
 Then select the user (`scansnap-bridge`) on the touch panel – `select` (= C2 bytes 32–39) can only be
 changed on the panel. From then on, scans run under our own identity.
@@ -424,7 +465,7 @@ Each item corresponds to an `# UNVERIFIED:` marker in the code (location in pare
    exist. Unverified; a private backup of the user list exists.
 9. **How long does the panel wait** for the host after "Scan"? (`button.py`): about 32 s and about 10 s
    were seen live, both without a session; the rule is not known.
-10. **UDP 53220**: the power-on notice (event 0x21) is captured (see
+10. **UDP 53220** (`button.BootListener`): the power-on notice (event 0x21) is captured (see
     [Boot notice](#boot-notice-udp-53220)) and has the layout of the iX500's power-on notice
     ([iX500 protocol](protocol-ix500.md#notifications-udp-48-b)). In the session capture the scanner
     also sent event 0x30 to UDP 53220 after each accepted 0x0110 (three times, button layout), and once
@@ -438,3 +479,6 @@ Each item corresponds to an `# UNVERIFIED:` marker in the code (location in pare
     "conn_user" during `claim` on an iX1500 ([issue #19](https://github.com/elte0/scansnack/issues/19)),
     i.e. the reply lacked `conn_user` (or its `select`). Which reply the scanner sent, and in which state,
     is unknown; the captures always contain it.
+14. **Profile icons and colours** (`control.plan_own_profiles`): `color_id` 0 was not written on its own;
+    icon ids 73, 75–82 and from 84 on were not written; why ScanSnap Home sent no 0x0610 for a panel press
+    (one capture); what 0x0200 returns before any profile was tapped.

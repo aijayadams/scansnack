@@ -11,9 +11,10 @@ import json
 import socket
 import struct
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
-from typing import Any
+from typing import Any, cast
 
 from ...core.fixes import IX1500_PAIRING_CLEANUP, Fixes
 from . import wire
@@ -22,6 +23,7 @@ CONTROL_PORT = 53219
 
 SUB_GET_USERS = 0x0100
 SUB_SET_PROFILES = 0x0110
+SUB_TAPPED_PROFILE = 0x0200
 SUB_ANNOUNCE = 0x0210
 SUB_SELECT_PROFILE = 0x0610
 SUB_SCAN_SETTINGS = 0x0810
@@ -89,6 +91,41 @@ def parse_json_response(frame: bytes) -> tuple[int, Any]:
 
 # The scanner rejects longer user names in 0x0110 with 0xffffffff (tested: 30 ok, 31 not).
 MAX_NAME_LEN = 30
+
+
+def plan_own_profiles(
+    previous: Sequence[dict[str, Any]],
+    names: Sequence[str],
+    base: dict[str, Any],
+    first_order: int,
+    new_id: Callable[[], str] = lambda: uuid.uuid4().hex.upper(),
+    icons: Mapping[str, int] | None = None,
+    colors: Mapping[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Our profiles, one per name in ``names`` (one touch panel button each), built from ``base``.
+
+    A profile that already has the name keeps its ``prof_id``; ids of profiles whose name is no longer
+    wanted go to the remaining names in order (so a rename keeps the profile), and only then are new ids
+    made. ``disp_order`` counts up from ``first_order``. Names must be unique. ``icons`` and ``colors``
+    set ``icon_id`` and ``color_id`` per name (docs/protocol-ix1500.md, "Profile icons"); others keep
+    ``base``'s.
+    """
+    # UNVERIFIED: which icon_id and color_id values exist beyond those written (docs, "Open questions").
+    if len(set(names)) != len(names):
+        raise ValueError(f"profile names must be unique: {list(names)}")
+    by_name = {p.get("prof_name"): p for p in previous}
+    spare = [p for p in previous if p.get("prof_name") not in names]
+    own: list[dict[str, Any]] = []
+    for i, name in enumerate(names):
+        old = by_name.get(name) or (spare.pop(0) if spare else None)
+        prof_id = old["prof_id"] if old else new_id()
+        profile = dict(base, prof_id=prof_id, prof_name=name, disp_order=first_order + i)
+        if icons and name in icons:
+            profile["icon_id"] = icons[name]
+        if colors and name in colors:
+            profile["color_id"] = colors[name]
+        own.append(profile)
+    return own
 
 
 def profile_template() -> dict[str, Any]:
@@ -178,8 +215,19 @@ class Control:
             },
         )
 
-    def claim(self, host_ip: str) -> dict[str, Any]:
-        """Registers this host as a user with its own profile on the scanner.
+    def claim(
+        self,
+        host_ip: str,
+        profile_names: Sequence[str] | None = None,
+        icons: Mapping[str, int] | None = None,
+        colors: Mapping[str, int] | None = None,
+        user_color: int | None = None,
+    ) -> dict[str, Any]:
+        """Registers this host as a user with its own profile(s) on the scanner.
+
+        ``profile_names``: one profile (touch panel button) per name, with ``icons`` and ``colors`` per
+        name, see :func:`plan_own_profiles`; default: one profile named like the template. ``user_color``
+        is the ``color_id`` of the host's own entry (the icon in the panel's title bar); default 2.
 
         Only possible in the pairing state (0x11 with flag 5), otherwise the scanner replies
         with ``fffffffe``. Other users and profiles are kept; the selection
@@ -191,7 +239,7 @@ class Control:
         if not self.pairing_cleanup:
             # Previous behaviour, the default until fix #19 is confirmed: an error before 0x0110 (e.g. a reply
             # without conn_user → KeyError) skips finish_pairing and leaves the scanner in the pairing state.
-            payload = self._claim_payload(self.get_users(), host_ip)
+            payload = self._claim_payload(self.get_users(), host_ip, profile_names, icons, colors, user_color)
             try:
                 self._set_profiles_and_announce(host_ip, payload)
             finally:
@@ -206,15 +254,23 @@ class Control:
                     f"0x0100 reply has no conn_user.select (keys: {sorted(current)}); "
                     "is a computer selected on the touch panel?"
                 )
-            payload = self._claim_payload(current, host_ip)
+            payload = self._claim_payload(current, host_ip, profile_names, icons, colors, user_color)
             self._set_profiles_and_announce(host_ip, payload)
             return payload
         finally:
             # Always, also after errors: otherwise the touch panel shows "Processing" until power-off (#19).
             self.finish_pairing(host_ip)
 
-    def _claim_payload(self, current: dict[str, Any], host_ip: str) -> dict[str, Any]:
-        """0x0110 payload: the user list with our entry in its place, all profiles plus our own."""
+    def _claim_payload(
+        self,
+        current: dict[str, Any],
+        host_ip: str,
+        profile_names: Sequence[str] | None = None,
+        icons: Mapping[str, int] | None = None,
+        colors: Mapping[str, int] | None = None,
+        user_color: int | None = None,
+    ) -> dict[str, Any]:
+        """0x0110 payload: the user list with our entry in its place, all other profiles plus our own."""
         name = self.identity.name[:MAX_NAME_LEN]
         color_id = 2
         me = {
@@ -224,7 +280,7 @@ class Control:
             "scloud_user": "",
             "host_id": self.identity.host_id,
             "icon_id": 9,
-            "color_id": color_id,
+            "color_id": color_id if user_color is None else user_color,
         }
         # Replace our own entry in place: the scanner rejects a reordered list.
         users = [me if u.get("host_id") == self.identity.host_id else u for u in current["conn_user"]["users"]]
@@ -233,19 +289,20 @@ class Control:
         profiles = current.get("profiles", [])
         previous = [p for p in profiles if p.get("user_id") == self.identity.user_id]
         others = [p for p in profiles if p.get("user_id") != self.identity.user_id]
-        own = dict(
-            profile_template(),
-            prof_id=previous[0]["prof_id"] if previous else uuid.uuid4().hex.upper(),
-            user_name=name,
-            user_id=self.identity.user_id,
-            color_id=color_id,
-            host_address=host_ip,
-            disp_order=max((p.get("disp_order", 0) for p in others), default=0) + 1,
+        template = profile_template()
+        base = dict(template, user_name=name, user_id=self.identity.user_id, color_id=color_id, host_address=host_ip)
+        own = plan_own_profiles(
+            previous,
+            profile_names or [template["prof_name"]],
+            base,
+            max((p.get("disp_order", 0) for p in others), default=0) + 1,
+            icons=icons,
+            colors=colors,
         )
         payload = {
             "conn_user": {"users": users, "select": current["conn_user"]["select"]},
             "version": current.get("version", 3),
-            "profiles": [*others, own],
+            "profiles": [*others, *own],
         }
         return payload
 
@@ -262,8 +319,22 @@ class Control:
         return self.register(host_ip, flag=0)
 
     def select_profile(self, prof_id: str) -> None:
-        """Selects a profile; ScanSnap Home sends this immediately before every scan (before D5)."""
+        """Selects a profile; ScanSnap Home sends this before a scan started from the computer (before D5).
+        For a press on the touch panel the double-feed capture has 0x0200 → 0x0100 → D5 without it."""
         self.json_call(SUB_SELECT_PROFILE, {"version": 1, "prof_id": prof_id})
+
+    def tapped_profile(self) -> dict[str, Any] | None:
+        """The profile chosen on the touch panel for the last press of "Scan" (0x0200), or None.
+
+        The button notification does not say which profile was tapped; ScanSnap Home asks with 0x0200
+        right after it. The reply is ``{"profiles": [<that profile>], "version": 3}``: the profile as it was when
+        it was tapped. After 0x0110 renamed it, 0x0200 kept the old name (same ``prof_id``) until the next tap and
+        press, while the panel already showed the new name; match on ``prof_id``.
+        """
+        result: Any = self.json_call(SUB_TAPPED_PROFILE)
+        reply = cast("dict[str, Any]", result) if isinstance(result, dict) else {}
+        profiles = cast("list[dict[str, Any]]", reply.get("profiles") or [])
+        return profiles[0] if profiles else None
 
     def pick_profile(self, host_ip: str) -> dict[str, Any]:
         profiles = self.get_users().get("profiles", [])
