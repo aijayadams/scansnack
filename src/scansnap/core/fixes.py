@@ -23,7 +23,10 @@ class Fix:
 
 IX1500_PAIRING_CLEANUP = Fix("ix1500-pairing-cleanup", 19, "Scan hangs on “Processing”")
 
-AVAILABLE: tuple[Fix, ...] = (IX1500_PAIRING_CLEANUP,)
+# TODO(issue): replace 0 with the issue number
+IX1500_HOLD_PAPER_FAULTS = Fix("ix1500-hold-paper-faults", 0, "Double feeds go unnoticed")
+
+AVAILABLE: tuple[Fix, ...] = (IX1500_PAIRING_CLEANUP, IX1500_HOLD_PAPER_FAULTS)
 
 
 class Fixes:

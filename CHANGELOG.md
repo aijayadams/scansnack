@@ -11,12 +11,12 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 
 ### Added
 
-- iX1500: double feeds are detected, and after a double feed or a paper jam the scan waits as it does
-  with ScanSnap Home: put the sheets back and press *Scan* on the scanner to continue, or *Finish* to end
-  the scan (pages scanned before are kept). The app's status line says what the scanner is waiting for;
-  without an answer the scan ends after 5 minutes. A double-fed sheet is kept only if *Finish* is followed
-  by saving the image on the scanner. Network scans (AirScan) still end at once. A crumpled sheet can be
-  reported as a double feed too.
+- Fix to try: *#0: Double feeds go unnoticed* (iX1500). Double feeds are detected, and after a double feed
+  or a jam while a page is read the scan waits as it does with ScanSnap Home: put the sheets back and press
+  *Scan* on the scanner to continue, or *Finish* to end the scan (pages scanned before are kept). The status
+  line says what the scanner is waiting for; without an answer the scan ends after 5 minutes. A double-fed
+  sheet is kept only if *Finish* is followed by saving the image on the scanner. Network scans (AirScan)
+  end at once. A crumpled sheet can be reported as a double feed too.
 - iX1500 (library): a computer can have several touch panel profiles, each with its own icon and colour,
   and the client can ask which one was tapped for a press. The client can also be told when the scanner
   has powered on.

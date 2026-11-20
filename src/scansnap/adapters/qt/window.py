@@ -126,16 +126,16 @@ class ScanWorker(QObject):
 
     def _on_fault(self, fault: Fault) -> FaultDecision | None:
         """A batch held after a double feed or a jam (scan thread): the answer comes from the touch panel."""
-        if self.stopping:
-            return FaultDecision(resume=False, keep=False)
         if fault is not self._held:  # one object per hold; two holds on the same sheet compare equal
             self._held = fault
+            if self.stopping:
+                return FaultDecision(resume=False, keep=False)
             what = "Double feed" if fault.reason == "double feed" else "Paper jam"
             fix = "Put the sheets back" if fault.reason == "double feed" else "Clear the jam, put the sheet back"
             self.status.emit(
                 f"{what} on sheet {fault.sheet}. {fix} and press Scan on the scanner to continue, or Finish to stop."
             )
-        return None
+        return FaultDecision(resume=False, keep=False) if self.stopping else None
 
     @Slot()
     def open_connection(self) -> None:
@@ -195,7 +195,10 @@ class ScanWorker(QObject):
         except NoPaper:
             self.done.emit("No paper in the feeder.", False)
         except FeedError as e:
-            text = FEED_HELP.get(e.reason, f"The scanner reported a paper problem ({e.reason}).")
+            if self._held is not None:  # ended on the panel, from here or after the timeout: no advice needed
+                text = f"The scan ended after a {e.reason} on sheet {self._held.sheet}."
+            else:
+                text = FEED_HELP.get(e.reason, f"The scanner reported a paper problem ({e.reason}).")
             if count:
                 text += f"\n\nThe {count} page(s) scanned before are kept."
             self.done.emit(text, False)

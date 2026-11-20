@@ -87,12 +87,12 @@ def double_feed(status: bytes) -> int | None:
     return status[7]
 
 
-def panel_decision(status: bytes, keep: bool) -> FaultDecision | None:
+def panel_decision(status: bytes) -> FaultDecision | None:
     """The user's answer on the touch panel to a held batch, read from C2, or None while there is none.
 
     ScanSnap Home captures: "Scan" (continue) sets byte 4 bit 0 (SANE ``get_GHS_scan_sw``); "Finish" and then
-    "do not save the image" sets byte 14 bit 3, "save the image" byte 14 bit 6. ``keep`` is used for
-    "continue", which does not say whether to keep the image.
+    "do not save the image" sets byte 14 bit 3, "save the image" byte 14 bit 6. "Continue" does not say
+    whether to keep a double-fed sheet's image; it is not kept.
     """
     # UNVERIFIED: byte 14 bits 3 and 6 were each seen once, after a double feed; for a jam "Finish" was not tried.
     if len(status) < 15:
@@ -102,7 +102,8 @@ def panel_decision(status: bytes, keep: bool) -> FaultDecision | None:
     if status[14] & 0x08:
         return FaultDecision(resume=False, keep=False)
     if status[4] & 0x01:
-        return FaultDecision(resume=True, keep=keep)
+        # UNVERIFIED: whether ScanSnap Home keeps the double-fed image after "Scan" on the panel.
+        return FaultDecision(resume=True, keep=False)
     return None
 
 
@@ -146,7 +147,7 @@ class Scanner:
         self.poll_interval, self.on_hold, self.on_hold_tick = poll_interval, on_hold, on_hold_tick
         self.tick_every, self.hold_timeout = tick_every, hold_timeout
 
-    def _hold(self, fault: Fault, decide: Decide | None, keep: bool) -> FaultDecision:
+    def _hold(self, fault: Fault, decide: Decide | None) -> FaultDecision:
         """Wait for the user's answer, from the touch panel (C2) or from ``decide`` (None means "not yet")."""
         if self.on_hold:
             self.on_hold(fault)
@@ -158,7 +159,7 @@ class Scanner:
         # ScanSnap Home sent D8 or D6 right after each answer.)
         armed = False
         while True:
-            on_panel = panel_decision(self.ch.hardware_status(), keep)
+            on_panel = panel_decision(self.ch.hardware_status())
             answer = on_panel if armed else None
             armed = armed or on_panel is None
             if answer is None and decide is not None:
@@ -174,14 +175,15 @@ class Scanner:
                     self.on_hold_tick()
             time.sleep(self.poll_interval)
 
-    def _start(self, settings: ScanSettings) -> None:
-        """D8, E9, D4, C2, 03: at the start of a batch and, as ScanSnap Home does, to continue a held one."""
+    def _start(self, settings: ScanSettings, hold: bool) -> None:
+        """D8, E9, D4, (C2,) 03: at the start of a batch and, as ScanSnap Home does, to continue a held one."""
         ch = self.ch
         ch.checked(bytes.fromhex("d80000000000"))
         ch.checked(bytes.fromhex("e9000000000000200000"), out=window_block(settings))
         ch.checked(bytes.fromhex("d40000005000"), out=mode_block(settings))
-        # Like ScanSnap Home: C2 once after D4. A double-feed flag from an earlier batch is clear again here.
-        ch.hardware_status()
+        if hold:
+            # Like ScanSnap Home: C2 once after D4. A double-feed flag from an earlier batch is clear again here.
+            ch.hardware_status()
         ch.request_sense()
 
     def _read_page(self, read_len: int) -> tuple[list[bytes], int]:
@@ -209,22 +211,21 @@ class Scanner:
                     done[side], last = True, side
         return [b"".join(p) for p in parts], last
 
-    def scan(
-        self, settings: ScanSettings, *, decide: Decide | None = None, keep_double_feed: bool = False
-    ) -> Iterator[Sheet]:
+    def scan(self, settings: ScanSettings, *, hold: bool = False, decide: Decide | None = None) -> Iterator[Sheet]:
         """Scans all sheets in the feeder. Raises NoPaper if the feeder is empty.
 
-        After a double feed or a jam the batch is held, as ScanSnap Home does, until the user answers on the
-        touch panel or ``decide`` returns an answer. "Continue" goes on with the next sheet: the user puts the
-        jammed or double-fed sheets back first. A double-fed sheet's images are delivered with ``fault="double
-        feed"`` when the answer says ``keep``; for the panel's "continue" that is ``keep_double_feed``.
-        Ending the batch raises FeedError, after the double-fed sheet if it is kept.
+        With ``hold`` (opt-in fix ``core.fixes.IX1500_HOLD_PAPER_FAULTS``), double feeds are detected, and after
+        a double feed or a jam in a read the batch is held, as ScanSnap Home does, until the user answers on
+        the touch panel or ``decide`` returns an answer. "Continue" goes on with the next sheet: the user puts
+        the jammed or double-fed sheets back first. A double-fed sheet's images are delivered with
+        ``fault="double feed"`` when the answer says ``keep``. Ending the batch raises FeedError, after the
+        double-fed sheet if it is kept.
         """
         ch = self.ch
         ch.checked(bytes.fromhex("d50000010808"), out=b"\0" * 8, in_len=8)
         released = False
         try:
-            self._start(settings)
+            self._start(settings, hold)
             pages = 0
             while True:
                 r = ch.command(bytes.fromhex("e00000000000"))
@@ -240,20 +241,20 @@ class Scanner:
                 try:
                     (front, back), last = self._read_page(read_len(settings))
                 except FeedError as e:
-                    if e.reason != "paper jam":
+                    if e.reason != "paper jam" or not hold:
                         raise
                     # ScanSnap Home: D8 (no EE), the panel offers "Scan" (continue) and "Finish" (jam capture).
                     try:
                         ch.checked(bytes.fromhex("d80000000000"))
                     except (OSError, wire.ProtocolError, ScsiError):
                         raise e from None  # cannot hold the batch: report the jam
-                    if not self._hold(Fault("paper jam", pages + 1), decide, keep=False).resume:
+                    if not self._hold(Fault("paper jam", pages + 1), decide).resume:
                         raise
-                    self._start(settings)
+                    self._start(settings, hold)
                     continue
                 info = parse_image_info(ch.checked(_info_cdb(last), in_len=0x20).data)
                 # Like ScanSnap Home: C2 after the sheet's image info, where a double feed shows up.
-                code = double_feed(ch.hardware_status())
+                code = double_feed(ch.hardware_status()) if hold else None
                 if code is None:
                     pages += 1
                     yield Sheet(front, back if settings.duplex else None, info)
@@ -266,14 +267,13 @@ class Scanner:
                     ch.checked(bytes.fromhex("d80000000000"))
                 except (OSError, wire.ProtocolError, ScsiError):
                     raise fault from None  # cannot hold the batch: report the double feed
-                # UNVERIFIED: whether ScanSnap Home keeps the image after "Scan" on the panel; not by default here.
-                answer = self._hold(Fault("double feed", pages + 1), decide, keep_double_feed)
+                answer = self._hold(Fault("double feed", pages + 1), decide)
                 if answer.keep:
                     pages += 1
                     yield Sheet(front, back if settings.duplex else None, info, fault="double feed")
                 if not answer.resume:
                     raise fault
-                self._start(settings)
+                self._start(settings, hold)
         except BaseException:
             # Release the scanner, but report the error that stopped the scan, not a failing D6.
             released = True

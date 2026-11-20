@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from typing import Any, cast
 
-from ...core.fixes import Fixes
+from ...core.fixes import IX1500_HOLD_PAPER_FAULTS, Fixes
 from ...core.images import process
 from ...core.model import Decide, Fault, ScanSettings, Sheet
 from ...core.report import DeviceDiagnostics
@@ -298,14 +298,13 @@ class Device:
         handshake: bool = True,
         heartbeat: bool = True,
         decide: Decide | None = None,
-        keep_double_feed: bool = False,
     ) -> Iterator[Sheet]:
         """Scans all sheets in the feeder (``ports.scanner.ScannerPort``). Raises NoPaper if the feeder is empty.
 
         ``whiten`` sets the paper color to white (removes the background). ``select``, ``pair``, ``handshake``
         and ``heartbeat`` are switches for experiments (CLI) and only apply without ``keep_alive``.
-        ``decide`` (default: the one from :meth:`set_fault_handler`) and ``keep_double_feed``: see
-        :meth:`scanner.Scanner.scan` (a held batch after a paper fault). A held batch is not retried after a
+        ``decide`` (default: the one from :meth:`set_fault_handler`): see :meth:`scanner.Scanner.scan` (a held
+        batch after a paper fault, with the fix ``IX1500_HOLD_PAPER_FAULTS``). A held batch is not retried after a
         connection loss, because the scanner would feed the next sheet without the user's answer.
         """
         decide = decide or self.decide
@@ -314,7 +313,7 @@ class Device:
             if select and not self.profile_id:
                 self.ensure_profile()
             with session(self.ctl, self.ip, self.ident, pair=pair, handshake=handshake, heartbeat=heartbeat) as ch:
-                yield from self._scan(ch, settings, select, whiten, decide=decide, keep_double_feed=keep_double_feed)
+                yield from self._scan(ch, settings, select, whiten, decide=decide)
             return
         for attempt in range(2):
             delivered = False
@@ -332,7 +331,6 @@ class Device:
                         whiten,
                         resume_polling=True,
                         decide=decide,
-                        keep_double_feed=keep_double_feed,
                         on_hold_tick=s.announce,
                     ):
                         delivered = True
@@ -356,7 +354,6 @@ class Device:
         *,
         resume_polling: bool = False,
         decide: Decide | None = None,
-        keep_double_feed: bool = False,
         on_hold_tick: Callable[[], None] | None = None,
     ) -> Iterator[Sheet]:
         self._held = False
@@ -382,7 +379,8 @@ class Device:
                 self.stage = f"waiting for the user ({fault.reason} on sheet {fault.sheet})"
 
             scanner = Scanner(ch, on_hold=on_hold, on_hold_tick=on_hold_tick)
-            for sheet in scanner.scan(settings, decide=decide, keep_double_feed=keep_double_feed):
+            hold = self.fixes.enabled(IX1500_HOLD_PAPER_FAULTS)
+            for sheet in scanner.scan(settings, hold=hold, decide=decide):
                 if self.rotate or self.crop or whiten:
 
                     def fix(jpeg: bytes) -> bytes:

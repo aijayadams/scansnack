@@ -40,9 +40,7 @@ described in the [protocol write-ups](protocol.md).
   "Load paper" and dims while the feeder is empty. If the iX500 does not accept its Wi-Fi password, the app asks for it once
   and remembers it.
 - **Saved right away** – every scan becomes its own PDF in the folder you choose, named after date and
-  time. Pages scanned before a paper jam or a double feed are kept.
-- **Double feed or jam: carry on** – with an iX1500 the scan waits, as with ScanSnap Home: put the sheets
-  back and press *Scan* on the scanner to continue, or *Finish* to end the scan. The status line says so.
+  time. Pages scanned before a paper jam are kept.
 - **Document list** – your scans stay in the list across restarts. Open a document to rotate, delete or
   reorder pages (drag and drop) and rename it; *Save Changes* rewrites the PDF.
 - **Clear help for paper problems** – paper jam, double feed, open cover and similar errors come with a

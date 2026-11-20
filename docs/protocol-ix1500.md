@@ -332,7 +332,8 @@ one jam capture the user put the jammed sheet back before "Scan", and the next E
 sheet's two sides with an option to keep the image; the images have already been read when the fault is
 known.
 
-Our client does the same: it holds the batch, takes the panel's answer from C2 (only after a poll without
+With the opt-in fix `ix1500-hold-paper-faults` (`core.fixes`) our client does the same: it reads C2 after
+D4 and after each sheet's image info, holds the batch, takes the panel's answer from C2 (only after a poll without
 one) or an answer from the app (`decide`), delivers a double-fed sheet with `fault="double feed"` if it is
 kept, and continues or ends the batch with FeedError. Without an answer it ends the batch after 5 minutes
 (our choice; the longest captured hold lasted about 33 s). A jam that E0 reports ends the batch at once.

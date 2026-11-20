@@ -75,7 +75,7 @@ def test_scan_against_mock(fixture: str, settings: Settings) -> None:
         assert Image.open(io.BytesIO(jpeg)).size == Image.open(io.BytesIO(expected)).size
 
     ops = [cdb[0] for cdb, _ in mock.received if cdb[0] != 0x28]
-    assert ops[:6] == [0xD5, 0xD8, 0xE9, 0xD4, 0xC2, 0x03]  # C2 after D4 as in the private double-feed capture
+    assert ops[:5] == [0xD5, 0xD8, 0xE9, 0xD4, 0x03]
     assert ops[-1] == 0xD6
     sent = {cdb[0]: out for cdb, out in mock.received}
     assert sent[0xE9] == window_block(settings)
@@ -162,10 +162,7 @@ def test_session_open_and_polling_against_mock() -> None:
         mock.close()
     ops = [cdb[0] for cdb, _ in mock.received]
     assert ops[:4] == [0x12, 0x12, 0xE7, 0xC2] and ops.count(0xC2) > 2
-    # During the scan polling is paused; C2 only after D4 and after the sheet's info read (like ScanSnap Home).
-    during = mock.received[[c[0] for c, _ in mock.received].index(0xD5) :]
-    c2 = [i for i, (cdb, _) in enumerate(during) if cdb[0] == 0xC2]
-    assert [during[i - 1][0][:3] for i in c2] == [bytes.fromhex("d40000"), bytes.fromhex("280080")]
+    assert 0xC2 not in ops[ops.index(0xD5) :]
 
 
 def test_heartbeat_probe_and_reply_counting() -> None:
@@ -369,9 +366,9 @@ def test_next_batch_after_a_double_feed_scans_normally() -> None:
     try:
         with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch:
             with pytest.raises(FeedError):
-                list(Scanner(ch, poll_interval=0.01).scan(Settings()))  # the panel answers "finish"
+                list(Scanner(ch, poll_interval=0.01).scan(Settings(), hold=True))  # the panel answers "finish"
             mock.refill()
-            assert len(list(Scanner(ch).scan(Settings()))) == 2
+            assert len(list(Scanner(ch).scan(Settings(), hold=True))) == 2
     finally:
         mock.close()
 
@@ -382,7 +379,7 @@ def test_double_feed_is_reported_when_the_connection_drops_on_ee() -> None:
     mock.drop_on = 0xEE  # EE and the D6 after it both fail
     try:
         with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
-            list(Scanner(ch).scan(Settings()))
+            list(Scanner(ch).scan(Settings(), hold=True))
         assert err.value.reason == "double feed"
     finally:
         mock.close()
@@ -487,7 +484,7 @@ def run_scan(
     sheets: list[Sheet] = []
     try:
         with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch:
-            sheets.extend(Scanner(ch, poll_interval=0.01, **(scanner or {})).scan(settings, **kwargs))
+            sheets.extend(Scanner(ch, poll_interval=0.01, **(scanner or {})).scan(settings, hold=True, **kwargs))
     except FeedError as e:
         return sheets, e
     return sheets, None
@@ -525,14 +522,6 @@ def test_double_feed_continue_on_the_panel_scans_the_rest() -> None:
         cont = held.index(0xD8)  # ScanSnap Home's continue: D8, E9, D4, C2, then E0
         assert held[cont : cont + 5] == [0xD8, 0xE9, 0xD4, 0xC2, 0xE0] and seq[-1] == 0xD6
         assert 0xD5 not in held
-    finally:
-        mock.close()
-
-    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
-    mock.double_feed_at, mock.panel_choice = 1, "continue"
-    try:
-        sheets, err = run_scan(mock, Settings(), keep_double_feed=True)
-        assert err is None and [s.fault for s in sheets] == [None, "double feed", None]
     finally:
         mock.close()
 
@@ -677,14 +666,28 @@ def test_a_failing_tick_does_not_end_the_hold() -> None:
         mock.close()
 
 
+def test_without_the_fix_the_scan_sequence_is_unchanged() -> None:
+    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=3)
+    mock.double_feed_at, mock.jam_in_read_at = 0, 1
+    pages: list[Sheet] = []
+    try:
+        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
+            pages.extend(Scanner(ch).scan(Settings(duplex=True)))
+        assert err.value.reason == "paper jam" and len(pages) == 1  # the double feed goes unnoticed
+        seq = ops(mock)
+        assert 0xC2 not in seq and 0xEE not in seq and seq[-1] == 0xD6  # ends at the jam, not held
+    finally:
+        mock.close()
+
+
 def test_panel_decision() -> None:
     # C2 blocks from the private ScanSnap Home decision captures (host ID bytes left out)
     held = bytes.fromhex("00008000000001550000000004090000e000000000180000")
     cont = bytes.fromhex("00008000010001550000000004090000e000000000190000")
     finish = bytes.fromhex("00000080000001550000000004090800e000000000180000")
     finish_keep = bytes.fromhex("00000080000001550000000004094000e000000000190000")
-    assert panel_decision(held, keep=True) is None
-    assert panel_decision(cont, keep=False) == FaultDecision(resume=True, keep=False)
-    assert panel_decision(finish, keep=True) == FaultDecision(resume=False, keep=False)
-    assert panel_decision(finish_keep, keep=False) == FaultDecision(resume=False, keep=True)
-    assert panel_decision(bytes(8), keep=True) is None
+    assert panel_decision(held) is None
+    assert panel_decision(cont) == FaultDecision(resume=True, keep=False)
+    assert panel_decision(finish) == FaultDecision(resume=False, keep=False)
+    assert panel_decision(finish_keep) == FaultDecision(resume=False, keep=True)
+    assert panel_decision(bytes(8)) is None

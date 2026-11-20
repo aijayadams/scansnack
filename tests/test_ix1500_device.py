@@ -13,6 +13,7 @@ from scansnap.adapters.ix1500.button import Notification
 from scansnap.adapters.ix1500.control import Control, HostIdentity
 from scansnap.adapters.ix1500.scsi import ScsiChannel
 from scansnap.core.errors import FeedError
+from scansnap.core.fixes import IX1500_HOLD_PAPER_FAULTS
 from scansnap.core.model import Fault, FaultDecision
 from scansnap.core.model import ScanSettings as Settings
 
@@ -333,6 +334,7 @@ def test_held_batch_uses_the_fault_handler_and_is_not_retried(fake_sessions: Ses
     dev, _ = make_device()
     dev.connect()
     mocks[0].double_feed_at, mocks[0].panel_choice = 0, None
+    dev.fixes.set(IX1500_HOLD_PAPER_FAULTS, True)
     asked: list[tuple[Fault, str]] = []
 
     def decide(fault: Fault) -> FaultDecision | None:
@@ -354,6 +356,7 @@ def test_a_held_batch_does_not_stop_the_next_scan_from_retrying(
     dev, _ = make_device()
     dev.connect()
     mocks[0].double_feed_at, mocks[0].panel_choice = 0, "finish"
+    dev.fixes.set(IX1500_HOLD_PAPER_FAULTS, True)
     with pytest.raises(FeedError):
         list(dev.scan(Settings()))
     real_live = dev._live_session  # pyright: ignore[reportPrivateUsage]

@@ -286,7 +286,7 @@ def test_closing_ends_a_held_batch() -> None:
     worker.done.connect(on_done)
     worker.stopping = True
     worker.scan(app_main.PRESETS[0])
-    assert messages and messages[0].startswith("Several sheets were fed at once")
+    assert messages == ["The scan ended after a double feed on sheet 2.\n\nThe 1 page(s) scanned before are kept."]
 
 
 def test_unreachable_scanner_at_start_opens_dialog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
