@@ -245,9 +245,9 @@ Status 2 = CHECK CONDITION → fetch `03` REQUEST SENSE (18 B).
 ScanSnap Home keeps 53218 open permanently and polls C2 every 250 ms. During a scan the polling mostly
 pauses (in 6 of the batches in the decision captures one more C2 came between D5 and D8). ScanSnap Home
 sends C2 once after D4 and once after each sheet's image info (double-feed and decision captures). While a
-batch is held after a paper fault the normal 250 ms polling resumes, 0.8–1.1 s after D8 (7 holds); the touch
-panel's answer arrives only there (see [Held batch](#held-batch-after-a-double-feed-or-a-jam)). Bit names in parentheses
-are those of SANE's fujitsu backend (`backend/fujitsu-scsi.h`, `get_GHS_*`).
+batch is held after a paper fault the normal 250 ms polling resumes, 0.8–1.1 s after D8 (7 holds); the
+touch panel's answer arrives only there (see [Held batch](#held-batch-after-a-double-feed-or-a-jam)). Bit
+names in parentheses are those of SANE's fujitsu backend (`backend/fujitsu-scsi.h`, `get_GHS_*`).
 
 | Data offset | Content |
 |---|---|
@@ -324,12 +324,13 @@ end:          D6
 
 The user answers either in ScanSnap Home's window ("Continuous scan" / "Quit"; no traffic, the host just
 continues or ends) or on the touch panel, which ScanSnap Home sees only in C2: "Scan" sets byte 4 bit 0,
-"Finish" followed by "do not save the image" byte 14 bit 3 (once), followed by "save the image" byte 14 bit 6
-(once). Where the following poll was captured (3 answers), the bit was set in that one C2 poll only. No UDP notification is sent for these. After a jam
-the panel offers "Scan" and "Finish" as well; in the one jam capture the user put the jammed sheet back
-before "Scan", and the next E0 fed it again. After "continue" the next E0 reports no sense for the double
-feed. ScanSnap Home's window shows the double-fed sheet's two sides with an option to keep the image; the
-images have already been read when the fault is known.
+"Finish" followed by "do not save the image" byte 14 bit 3 (once), followed by "save the image" byte 14
+bit 6 (once). Where the following poll was captured (3 answers), the bit was set in that one C2 poll only.
+No UDP notification is sent for these. After a jam the panel offers "Scan" and "Finish" as well; in the
+one jam capture the user put the jammed sheet back before "Scan", and the next E0 fed it again. After
+"continue" the next E0 reports no sense for the double feed. ScanSnap Home's window shows the double-fed
+sheet's two sides with an option to keep the image; the images have already been read when the fault is
+known.
 
 Our client does the same: it holds the batch, takes the panel's answer from C2 (only after a poll without
 one) or an answer from the app (`decide`), delivers a double-fed sheet with `fault="double feed"` if it is
