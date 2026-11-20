@@ -11,7 +11,7 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 
 ### Added
 
-- Fix to try: *#0: Double feeds go unnoticed* (iX1500). Double feeds are detected, and after a double feed
+- Fix to try: *#24: Double feeds go unnoticed* (iX1500). Double feeds are detected, and after a double feed
   or a jam while a page is read the scan waits as it does with ScanSnap Home: put the sheets back and press
   *Scan* on the scanner to continue, or *Finish* to end the scan (pages scanned before are kept). The status
   line says what the scanner is waiting for; without an answer the scan ends after 5 minutes. A double-fed
