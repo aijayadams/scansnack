@@ -73,10 +73,10 @@ def _save(pages: Iterable[Sheet], out: Path) -> int:
 
 def _tell_user() -> Decide:
     """For a batch held after a paper fault: says once per fault that the answer is on the touch panel."""
-    told: list[Fault] = []
+    told: list[Fault] = []  # one object per hold; two holds on the same sheet compare equal
 
     def decide(fault: Fault) -> None:
-        if fault not in told[-1:]:
+        if not told or told[-1] is not fault:
             told.append(fault)
             print(
                 f"{fault.reason.capitalize()} on sheet {fault.sheet}: press Scan on the scanner to continue, "

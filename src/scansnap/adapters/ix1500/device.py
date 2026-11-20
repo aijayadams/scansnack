@@ -309,6 +309,7 @@ class Device:
         connection loss, because the scanner would feed the next sheet without the user's answer.
         """
         decide = decide or self.decide
+        self._held = False
         if not self.keep_alive:
             if select and not self.profile_id:
                 self.ensure_profile()

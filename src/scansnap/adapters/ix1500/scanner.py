@@ -150,9 +150,12 @@ class Scanner:
         """Wait for the user's answer, from the touch panel (C2) or from ``decide`` (None means "not yet")."""
         if self.on_hold:
             self.on_hold(fault)
+        # UNVERIFIED: the timeout is our choice; the longest captured hold lasted about 33 s, and what the
+        # scanner does during a longer one is not known.
         started = ticked = time.monotonic()
-        # A panel answer counts only after a poll without one: in the captures each answer bit was set for a
-        # single poll, and one still set from an earlier answer must not answer this fault.
+        # A panel answer counts only after a poll without one, so that a bit still set from an earlier answer
+        # cannot answer this fault. (Whether the scanner clears the bits by itself is not known: in the captures
+        # ScanSnap Home sent D8 or D6 right after each answer.)
         armed = False
         while True:
             on_panel = panel_decision(self.ch.hardware_status(), keep)
@@ -225,20 +228,21 @@ class Scanner:
             pages = 0
             while True:
                 r = ch.command(bytes.fromhex("e00000000000"))
+                if r.status == CHECK_CONDITION:
+                    sense = ch.request_sense()
+                    if sense.no_paper:
+                        if pages == 0:
+                            raise NoPaper("no paper in feeder")
+                        return
+                    # UNVERIFIED: whether ScanSnap Home holds the batch after a jam that E0 reports (not
+                    # captured); here it ends, as before.
+                    raise _sense_error("feed failed", sense)
                 try:
-                    if r.status == CHECK_CONDITION:
-                        sense = ch.request_sense()
-                        if sense.no_paper:
-                            if pages == 0:
-                                raise NoPaper("no paper in feeder")
-                            return
-                        raise _sense_error("feed failed", sense)
                     (front, back), last = self._read_page(read_len(settings))
                 except FeedError as e:
                     if e.reason != "paper jam":
                         raise
                     # ScanSnap Home: D8 (no EE), the panel offers "Scan" (continue) and "Finish" (jam capture).
-                    # UNVERIFIED: holding after a jam that E0 reports; only jams in a read were captured.
                     try:
                         ch.checked(bytes.fromhex("d80000000000"))
                     except (OSError, wire.ProtocolError, ScsiError):

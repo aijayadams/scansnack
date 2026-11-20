@@ -128,7 +128,7 @@ class ScanWorker(QObject):
         """A batch held after a double feed or a jam (scan thread): the answer comes from the touch panel."""
         if self.stopping:
             return FaultDecision(resume=False, keep=False)
-        if fault != self._held:
+        if fault is not self._held:  # one object per hold; two holds on the same sheet compare equal
             self._held = fault
             what = "Double feed" if fault.reason == "double feed" else "Paper jam"
             fix = "Put the sheets back" if fault.reason == "double feed" else "Clear the jam, put the sheet back"

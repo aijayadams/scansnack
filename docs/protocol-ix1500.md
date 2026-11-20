@@ -251,7 +251,7 @@ names in parentheses are those of SANE's fujitsu backend (`backend/fujitsu-scsi.
 
 | Data offset | Content |
 |---|---|
-| 2, bit 7 | (`top`) set during both captured jam holds until the cover was opened; set in 1 of 6 double-feed holds (until the sheet after the continue); also set for a few polls without any fault (two captures) |
+| 2, bit 7 | (`top`) set after all three captured jams until the cover was opened; set in 1 of 6 ScanSnap Home double-feed holds (until the sheet after the continue) and for about 55 polls after one of our client's double feeds |
 | 3, bit 7 | (`hopper`) feeder empty |
 | 3, bit 5 | (`adf_open`) cover open (session capture) |
 | 4, bit 0 | (`scan_sw`) scan button pressed (~0.3 s pulse); while a batch is held: "Scan" (continue) on the panel |
@@ -325,8 +325,8 @@ end:          D6
 The user answers either in ScanSnap Home's window ("Continuous scan" / "Quit"; no traffic, the host just
 continues or ends) or on the touch panel, which ScanSnap Home sees only in C2: "Scan" sets byte 4 bit 0,
 "Finish" followed by "do not save the image" byte 14 bit 3 (once), followed by "save the image" byte 14
-bit 6 (once). Where the following poll was captured (3 answers), the bit was set in that one C2 poll only.
-No UDP notification is sent for these. After a jam the panel offers "Scan" and "Finish" as well; in the
+bit 6 (once). Each time ScanSnap Home sent D8 or D6 right after the answer, so whether the scanner clears
+these bits by itself is not known. No UDP notification is sent for these. After a jam the panel offers "Scan" and "Finish" as well; in the
 one jam capture the user put the jammed sheet back before "Scan", and the next E0 fed it again. After
 "continue" the next E0 reports no sense for the double feed. ScanSnap Home's window shows the double-fed
 sheet's two sides with an option to keep the image; the images have already been read when the fault is
@@ -334,7 +334,8 @@ known.
 
 Our client does the same: it holds the batch, takes the panel's answer from C2 (only after a poll without
 one) or an answer from the app (`decide`), delivers a double-fed sheet with `fault="double feed"` if it is
-kept, and continues or ends the batch with FeedError. Without an answer it ends the batch after 5 minutes.
+kept, and continues or ends the batch with FeedError. Without an answer it ends the batch after 5 minutes
+(our choice; the longest captured hold lasted about 33 s). A jam that E0 reports ends the batch at once.
 The flag stays set after the batch has ended until the next one's D4 (session capture). Once, with the flag
 of an earlier batch still set, ScanSnap Home sent EE with `80 00 ff ff 00 00 00 00` before starting a new
 batch; the second time the same state came up it sent no EE (decision captures).
@@ -545,8 +546,8 @@ Each item corresponds to an `# UNVERIFIED:` marker in the code (location in pare
     is unknown; the captures always contain it.
 14. **C2 error codes other than 0x55** (`scanner.double_feed`): none seen; they are not acted on.
 15. **The panel's answers** (`scanner.panel_decision`): byte 14 bits 3 and 6 were each seen once, after a
-    double feed; "Finish" after a jam was not tried. Byte 21 bit 0 changed with "Scan" and with "save the
-    image"; its meaning is not known.
+    double feed; "Finish" after a jam was not tried. Byte 21 bit 0 changed with 1 of 2 "Scan" answers and
+    with "save the image"; its meaning is not known.
 16. **EE data** (`scanner.Scanner.scan`): `00 00 00 55 00 00 00 00` after each double feed; once
     `80 00 ff ff 00 00 00 00` before a new batch while an earlier double-feed flag was still set. The layout
     is not known.
@@ -555,7 +556,9 @@ Each item corresponds to an `# UNVERIFIED:` marker in the code (location in pare
 18. **Profile icons and colours** (`control.plan_own_profiles`): `color_id` 0 was not written on its own;
     icon ids 73, 75–82 and from 84 on were not written; why ScanSnap Home sent no 0x0610 for a panel press
     (one capture); what 0x0200 returns before any profile was tapped.
-19. **A jam reported by E0** (`scanner.Scanner.scan`): every captured jam ended a read; that E0's 3/80/01
-    leads to the same hold (D8, then "Scan" or "Finish" on the panel) is assumed.
+19. **A jam reported by E0** (`scanner.Scanner.scan`): every captured jam ended a read; whether ScanSnap
+    Home holds the batch after E0's 3/80/01 too is not known, so our client ends it.
 20. **The double-fed image after "Scan" on the panel** (`scanner.Scanner.scan`): whether ScanSnap Home keeps
     it is not visible in the traffic; our client drops it unless `keep_double_feed` is set.
+21. **How long a batch can be held** (`scanner.Scanner._hold`): the longest captured hold lasted about 33 s;
+    the 5-minute timeout is our choice, and what the scanner does during a longer hold is not known.

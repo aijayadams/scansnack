@@ -592,12 +592,13 @@ def test_jam_finish_on_the_panel_reports_the_jam() -> None:
         mock.close()
 
 
-def test_jam_at_feed_holds_too() -> None:
+def test_jam_at_feed_ends_the_batch() -> None:
     mock = MockScanner("02_grayscale_simplex_normalquality", sheets=2)
     mock.jam_at, mock.panel_choice = 1, "continue"
     try:
         sheets, err = run_scan(mock, Settings())
-        assert err is None and len(sheets) == 2
+        assert err is not None and err.reason == "paper jam" and len(sheets) == 1
+        assert ops(mock)[-2:] == [0xE0, 0xD6]  # not held: E0's jam was never captured with ScanSnap Home
     finally:
         mock.close()
 
@@ -632,11 +633,11 @@ def test_the_app_can_end_the_batch_at_once() -> None:
 
 
 def test_two_faults_in_one_batch_are_answered_separately() -> None:
-    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=4)
-    mock.double_feed_at, mock.jam_at, mock.panel_choice = 0, 2, "continue"
+    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=4)
+    mock.double_feed_at, mock.jam_in_read_at, mock.panel_choice = 0, 2, "continue"
     held: list[Fault] = []
     try:
-        sheets, err = run_scan(mock, Settings(), {"on_hold": held.append})
+        sheets, err = run_scan(mock, Settings(duplex=True), {"on_hold": held.append})
         assert err is None and len(sheets) == 3  # the double-fed sheet is not kept
         assert held == [Fault("double feed", 1), Fault("paper jam", 2)]  # counted in the delivered sheets
     finally:
@@ -644,10 +645,10 @@ def test_two_faults_in_one_batch_are_answered_separately() -> None:
 
 
 def test_a_panel_bit_left_set_does_not_answer_the_next_fault() -> None:
-    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=4)
-    mock.double_feed_at, mock.jam_at, mock.panel_choice, mock.panel_stuck = 0, 2, "continue", True
+    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=4)
+    mock.double_feed_at, mock.jam_in_read_at, mock.panel_choice, mock.panel_stuck = 0, 2, "continue", True
     try:
-        sheets, err = run_scan(mock, Settings(), {"hold_timeout": 0.3})
+        sheets, err = run_scan(mock, Settings(duplex=True), {"hold_timeout": 0.3})
         assert err is not None and err.reason == "paper jam" and len(sheets) == 1  # waited, then timed out
     finally:
         mock.close()
