@@ -1,5 +1,6 @@
-"""Scan sequence D5, D8, E9, D4, C2, 03, (E0, 28 reads, 28 info, C2)*, D6 on the scan channel; EE after a
-double feed.
+"""Scan sequence D5, D8, E9, D4, C2, 03, (E0, 28 reads, 28 info, C2)*, D6 on the scan channel. After a double
+feed (EE + D8) or a jam (D8) the batch is held until the user decides on the touch panel or in the app; it
+continues with D8, E9, D4, C2, 03, E0 or ends with D6.
 
 Flow and parameter blocks: docs/protocol-ix1500.md, section "Scan sequence".
 """
@@ -8,21 +9,19 @@ from __future__ import annotations
 
 import contextlib
 import struct
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 
 from ...core.errors import FeedError, NoPaper
-from ...core.model import SCAN_HEIGHT_1200, SCAN_WIDTH_1200, ImageInfo, ScanSettings, Sheet
+from ...core.model import SCAN_HEIGHT_1200, SCAN_WIDTH_1200, Fault, FaultDecision, ImageInfo, ScanSettings, Sheet
 from . import wire
 from .scsi import CHECK_CONDITION, ScsiChannel, ScsiError, Sense
 
-# Combinations whose parameter blocks come 1:1 from captures, with the read length from the capture. color/300 is
-# from a capture of a profile with automatic color mode and resolution (see _CAPTURED_MODE_BLOCKS).
+# Combinations whose parameter blocks come 1:1 from captures, with the read length from the capture
 VERIFIED: dict[tuple[str, int], int] = {("gray", 150): 0x300000, ("color", 600): 0x20000, ("color", 300): 0x300000}
 
-# D4 blocks as ScanSnap Home sent them, where they differ from the derived block. color/300: from the private
-# double-feed capture, for a profile with automatic color mode and resolution that delivered a 300 dpi
-# 3-channel JPEG.
-# UNVERIFIED: the full block for a profile set to color/300 explicitly; bytes 10, 13 and 40 match.
+# D4 blocks as ScanSnap Home sent them, where they differ from the derived block. color/300: private quality and
+# double-feed captures (profiles set to color, gray and monochrome at "Best", and automatic).
 _CAPTURED_MODE_BLOCKS: dict[tuple[str, int], bytes] = {
     ("color", 300): bytes.fromhex(
         "00030101d000c1808080908080000000000000000000000000000000000000300010012c012c05810d00000028d0000044dc04"
@@ -79,6 +78,25 @@ def double_feed(status: bytes) -> int | None:
     return status[7]
 
 
+def panel_decision(status: bytes, keep: bool) -> FaultDecision | None:
+    """The user's answer on the touch panel to a held batch, read from C2, or None while there is none.
+
+    ScanSnap Home captures: "Scan" (continue) sets byte 4 bit 0 (SANE ``get_GHS_scan_sw``); "Finish" and then
+    "do not save the image" sets byte 14 bit 3, "save the image" byte 14 bit 6. ``keep`` is used for
+    "continue", which does not say whether to keep the image.
+    """
+    # UNVERIFIED: byte 14 bits 3 and 6 were each seen once, after a double feed; for a jam "Finish" was not tried.
+    if len(status) < 15:
+        return None
+    if status[14] & 0x40:
+        return FaultDecision(resume=False, keep=True)
+    if status[14] & 0x08:
+        return FaultDecision(resume=False, keep=False)
+    if status[4] & 0x01:
+        return FaultDecision(resume=True, keep=keep)
+    return None
+
+
 def _ack_cdb() -> bytes:
     return bytes.fromhex("ee0000000800")
 
@@ -96,11 +114,52 @@ def _info_cdb(side: int) -> bytes:
     return bytes([0x28, 0, 0x80, 0, 0, 0x80 if side else 0, 0, 0, 0x20, 0, side, 0])
 
 
-class Scanner:
-    """Scan sequence on an open scan channel."""
+Decide = Callable[[Fault], FaultDecision | None]
 
-    def __init__(self, channel: ScsiChannel):
+
+class Scanner:
+    """Scan sequence on an open scan channel.
+
+    While a batch is held after a paper fault, C2 is polled every ``poll_interval`` seconds for the panel's
+    answer, and ``on_hold_tick`` (e.g. 0x0210, as ScanSnap Home sends it while waiting) is called every
+    ``tick_every`` seconds.
+    """
+
+    def __init__(
+        self,
+        channel: ScsiChannel,
+        *,
+        poll_interval: float = 0.3,
+        on_hold_tick: Callable[[], None] | None = None,
+        tick_every: float = 10.0,
+    ):
         self.ch = channel
+        self.poll_interval, self.on_hold_tick, self.tick_every = poll_interval, on_hold_tick, tick_every
+
+    def _hold(self, fault: Fault, decide: Decide | None, keep: bool) -> FaultDecision:
+        """Wait for the user's answer, from the touch panel (C2) or from ``decide`` (None means "not yet")."""
+        ticked = time.monotonic()
+        while True:
+            answer = panel_decision(self.ch.hardware_status(), keep)
+            if answer is None and decide is not None:
+                answer = decide(fault)
+            if answer is not None:
+                return answer
+            if self.on_hold_tick and time.monotonic() - ticked >= self.tick_every:
+                ticked = time.monotonic()
+                with contextlib.suppress(OSError, wire.ProtocolError):
+                    self.on_hold_tick()
+            time.sleep(self.poll_interval)
+
+    def _start(self, settings: ScanSettings) -> None:
+        """D8, E9, D4, C2, 03: at the start of a batch and, as ScanSnap Home does, to continue a held one."""
+        ch = self.ch
+        ch.checked(bytes.fromhex("d80000000000"))
+        ch.checked(bytes.fromhex("e9000000000000200000"), out=window_block(settings))
+        ch.checked(bytes.fromhex("d40000005000"), out=mode_block(settings))
+        # Like ScanSnap Home: C2 once after D4. A double-feed flag from an earlier batch is clear again here.
+        ch.hardware_status()
+        ch.request_sense()
 
     def _read_page(self, read_len: int) -> tuple[list[bytes], int]:
         parts: list[list[bytes]] = [[], []]
@@ -127,45 +186,65 @@ class Scanner:
                     done[side], last = True, side
         return [b"".join(p) for p in parts], last
 
-    def scan(self, settings: ScanSettings) -> Iterator[Sheet]:
-        """Scans all sheets in the feeder. Raises NoPaper if the feeder is empty."""
+    def scan(
+        self, settings: ScanSettings, *, decide: Decide | None = None, keep_double_feed: bool = True
+    ) -> Iterator[Sheet]:
+        """Scans all sheets in the feeder. Raises NoPaper if the feeder is empty.
+
+        After a double feed or a jam the batch is held, as ScanSnap Home does, until the user answers on the
+        touch panel or ``decide`` returns an answer. "Continue" goes on with the next sheet: after a jam the
+        user puts the jammed sheet back. A double-fed sheet's images are delivered with ``fault="double
+        feed"`` when the answer says ``keep``; for the panel's "continue" that is ``keep_double_feed``.
+        Ending the batch raises FeedError, after the double-fed sheet if it is kept.
+        """
         ch = self.ch
         ch.checked(bytes.fromhex("d50000010808"), out=b"\0" * 8, in_len=8)
         released = False
         try:
-            ch.checked(bytes.fromhex("d80000000000"))
-            ch.checked(bytes.fromhex("e9000000000000200000"), out=window_block(settings))
-            ch.checked(bytes.fromhex("d40000005000"), out=mode_block(settings))
-            # Like ScanSnap Home: C2 once after D4. A double-feed flag from an earlier batch stays set until the
-            # next batch starts; here it was clear in every capture.
-            ch.hardware_status()
-            ch.request_sense()
+            self._start(settings)
             pages = 0
             while True:
                 r = ch.command(bytes.fromhex("e00000000000"))
-                if r.status == CHECK_CONDITION:
-                    sense = ch.request_sense()
-                    if sense.no_paper:
-                        if pages == 0:
-                            raise NoPaper("no paper in feeder")
-                        return
-                    raise _sense_error("feed failed", sense)
-                (front, back), last = self._read_page(read_len(settings))
+                try:
+                    if r.status == CHECK_CONDITION:
+                        sense = ch.request_sense()
+                        if sense.no_paper:
+                            if pages == 0:
+                                raise NoPaper("no paper in feeder")
+                            return
+                        raise _sense_error("feed failed", sense)
+                    (front, back), last = self._read_page(read_len(settings))
+                except FeedError as e:
+                    if e.reason != "paper jam":
+                        raise
+                    # ScanSnap Home: D8 (no EE), the panel offers "Scan" (continue) and "Finish" (jam capture).
+                    ch.checked(bytes.fromhex("d80000000000"))
+                    if not self._hold(Fault("paper jam", pages + 1), decide, keep=False).resume:
+                        raise
+                    self._start(settings)
+                    continue
                 info = parse_image_info(ch.checked(_info_cdb(last), in_len=0x20).data)
                 # Like ScanSnap Home: C2 after the sheet's image info, where a double feed shows up.
                 code = double_feed(ch.hardware_status())
-                if code is not None:
-                    # ScanSnap Home then sends EE with 8 bytes (00 00 00 55 00 00 00 00), then D8, and the panel
-                    # asks the user whether to continue. Here the batch stops; the sheet is not delivered.
-                    # UNVERIFIED: how the panel's "continue" reaches the host.
-                    # UNVERIFIED: the EE data layout (u32 error code, u32 0), from one sample.
-                    # UNVERIFIED: whether the next E0 would report a sense for the double feed.
-                    # UNVERIFIED: the meaning of C2 byte 2 bit 7, set after jams and once after a double feed.
-                    with contextlib.suppress(OSError, wire.ProtocolError):  # report the double feed regardless
-                        ch.command(_ack_cdb(), out=struct.pack(">II", code, 0))
-                    raise FeedError("double feed", f"sheet {pages + 1}, error code {code:#04x}")
-                pages += 1
-                yield Sheet(front, back if settings.duplex else None, info)
+                if code is None:
+                    pages += 1
+                    yield Sheet(front, back if settings.duplex else None, info)
+                    continue
+                fault = FeedError("double feed", f"sheet {pages + 1}, error code {code:#04x}")
+                # ScanSnap Home: EE with 8 bytes (00 00 00 55 00 00 00 00), then D8; the panel asks the user.
+                # UNVERIFIED: the EE data layout; also seen: 80 00 ff ff 00 00 00 00 before a new batch.
+                try:
+                    ch.checked(_ack_cdb(), out=struct.pack(">II", code, 0))
+                    ch.checked(bytes.fromhex("d80000000000"))
+                except (OSError, wire.ProtocolError, ScsiError):
+                    raise fault from None  # cannot hold the batch: report the double feed
+                answer = self._hold(Fault("double feed", pages + 1), decide, keep_double_feed)
+                if answer.keep:
+                    pages += 1
+                    yield Sheet(front, back if settings.duplex else None, info, fault="double feed")
+                if not answer.resume:
+                    raise fault
+                self._start(settings)
         except BaseException:
             # Release the scanner, but report the error that stopped the scan, not a failing D6.
             released = True

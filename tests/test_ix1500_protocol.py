@@ -21,12 +21,19 @@ from scansnap.adapters.ix1500.control import (
     register_body,
 )
 from scansnap.adapters.ix1500.discovery import ScannerInfo, parse_reply
-from scansnap.adapters.ix1500.scanner import Scanner, double_feed, mode_block, read_len, window_block
+from scansnap.adapters.ix1500.scanner import (
+    Scanner,
+    double_feed,
+    mode_block,
+    panel_decision,
+    read_len,
+    window_block,
+)
 from scansnap.adapters.ix1500.scsi import ScsiChannel
 from scansnap.core.errors import FeedError, NoPaper
 from scansnap.core.fixes import IX1500_PAIRING_CLEANUP, Fixes
+from scansnap.core.model import Fault, FaultDecision, Sheet
 from scansnap.core.model import ScanSettings as Settings
-from scansnap.core.model import Sheet
 
 PAIRING: dict[str, Any] = json.loads((FIXTURES / "01_pairing.json").read_text())
 CASES = {
@@ -356,29 +363,13 @@ def test_paper_jam_keeps_earlier_pages_and_releases_session() -> None:
         mock.close()
 
 
-def test_double_feed_stops_batch_acknowledges_and_releases_session() -> None:
-    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
-    mock.double_feed_at = 1  # the second sheet
-    pages: list[Sheet] = []
-    try:
-        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
-            pages.extend(Scanner(ch).scan(Settings()))
-        assert err.value.reason == "double feed" and "0x55" in str(err.value)
-        assert len(pages) == 1  # the double-fed sheet is not delivered
-        ops = [cdb[0] for cdb, _ in mock.received]
-        assert ops[-3:] == [0xC2, 0xEE, 0xD6]
-        assert mock.received[-2][1] == bytes.fromhex("0000005500000000")  # as ScanSnap Home sends it
-    finally:
-        mock.close()
-
-
 def test_next_batch_after_a_double_feed_scans_normally() -> None:
     mock = MockScanner("02_grayscale_simplex_normalquality", sheets=2)
     mock.double_feed_at = 0
     try:
         with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch:
             with pytest.raises(FeedError):
-                list(Scanner(ch).scan(Settings()))
+                list(Scanner(ch, poll_interval=0.01).scan(Settings()))  # the panel answers "finish"
             mock.refill()
             assert len(list(Scanner(ch).scan(Settings()))) == 2
     finally:
@@ -471,20 +462,6 @@ def test_tapped_profile() -> None:
     assert TappedControl(0).tapped_profile() is None
 
 
-def test_jam_during_a_read_reports_the_sense() -> None:
-    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=3)
-    mock.jam_in_read_at = 1
-    pages: list[Sheet] = []
-    try:
-        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
-            pages.extend(Scanner(ch).scan(Settings(duplex=True)))
-        assert err.value.reason == "paper jam" and len(pages) == 1
-        ops = [cdb[0] for cdb, _ in mock.received]
-        assert ops[-3:] == [0x28, 0x03, 0xD6]  # sense read before giving up
-    finally:
-        mock.close()
-
-
 def test_claim_sets_the_user_color() -> None:
     ident = HostIdentity("scansnap-bridge", "8ff7d20fae1b79f6", "OWNUSER", bytes(6))
     current: dict[str, Any] = {
@@ -502,3 +479,131 @@ def test_claim_sets_the_user_color() -> None:
 def test_tapped_profile_request_matches_capture() -> None:
     # 0x0200 as ScanSnap Home sent it (private double-feed capture): sub-command, no JSON
     assert json_body(0x0200, None).hex() == "00000010" + "0200" + "00" * 10 + "00000000"
+
+
+def run_scan(mock: MockScanner, settings: Settings, **kwargs: Any) -> tuple[list[Sheet], FeedError | None]:
+    sheets: list[Sheet] = []
+    try:
+        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch:
+            sheets.extend(Scanner(ch, poll_interval=0.01).scan(settings, **kwargs))
+    except FeedError as e:
+        return sheets, e
+    return sheets, None
+
+
+def ops(mock: MockScanner) -> list[int]:
+    return [cdb[0] for cdb, _ in mock.received if cdb[0] not in (0x28, 0x03)]
+
+
+def test_double_feed_holds_the_batch_and_finish_on_the_panel_ends_it() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
+    mock.double_feed_at, mock.panel_choice = 1, "finish"
+    try:
+        sheets, err = run_scan(mock, Settings())
+        assert err is not None and err.reason == "double feed" and "0x55" in str(err)
+        assert len(sheets) == 1  # "finish" without saving: the double-fed sheet is not delivered
+        seq = ops(mock)
+        ee = seq.index(0xEE)
+        assert seq[ee - 1 : ee + 2] == [0xC2, 0xEE, 0xD8] and seq[-1] == 0xD6
+        assert seq[ee + 2 :].count(0xC2) >= 3  # held: C2 polled until the panel answers
+        ee_out = next(out for cdb, out in mock.received if cdb[0] == 0xEE)
+        assert ee_out == bytes.fromhex("0000005500000000")  # as ScanSnap Home sends it
+    finally:
+        mock.close()
+
+
+def test_double_feed_continue_on_the_panel_scans_the_rest() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
+    mock.double_feed_at, mock.panel_choice = 1, "continue"
+    try:
+        sheets, err = run_scan(mock, Settings())
+        assert err is None and len(sheets) == 3
+        assert [s.fault for s in sheets] == [None, "double feed", None]  # kept by default
+        seq = ops(mock)
+        held = seq[seq.index(0xEE) + 2 :]
+        cont = held.index(0xD8)  # ScanSnap Home's continue: D8, E9, D4, C2, then E0
+        assert held[cont : cont + 5] == [0xD8, 0xE9, 0xD4, 0xC2, 0xE0] and seq[-1] == 0xD6
+    finally:
+        mock.close()
+
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
+    mock.double_feed_at, mock.panel_choice = 1, "continue"
+    try:
+        sheets, err = run_scan(mock, Settings(), keep_double_feed=False)
+        assert err is None and [s.fault for s in sheets] == [None, None]
+    finally:
+        mock.close()
+
+
+def test_double_feed_finish_with_image_delivers_the_sheet() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
+    mock.double_feed_at, mock.panel_choice = 1, "finish_keep"
+    try:
+        sheets, err = run_scan(mock, Settings())
+        assert err is not None and err.reason == "double feed"
+        assert [s.fault for s in sheets] == [None, "double feed"]
+    finally:
+        mock.close()
+
+
+def test_the_app_can_decide_instead_of_the_panel() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
+    mock.double_feed_at, mock.panel_choice = 1, None
+    asked: list[Fault] = []
+
+    def decide(fault: Fault) -> FaultDecision | None:
+        asked.append(fault)
+        return FaultDecision(resume=True, keep=False) if len(asked) > 2 else None
+
+    try:
+        sheets, err = run_scan(mock, Settings(), decide=decide)
+        assert err is None and len(sheets) == 2
+        assert asked[0] == Fault("double feed", 2)
+    finally:
+        mock.close()
+
+
+def test_jam_during_a_read_holds_and_continue_rescans_the_sheet() -> None:
+    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=3)
+    mock.jam_in_read_at, mock.panel_choice = 1, "continue"
+    try:
+        sheets, err = run_scan(mock, Settings(duplex=True))
+        assert err is None and len(sheets) == 3  # the user put the jammed sheet back
+        seq = ops(mock)
+        assert 0xEE not in seq  # ScanSnap Home: D8 only after a jam
+    finally:
+        mock.close()
+
+
+def test_jam_finish_on_the_panel_reports_the_jam() -> None:
+    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=3)
+    mock.jam_in_read_at, mock.panel_choice = 1, "finish"
+    try:
+        sheets, err = run_scan(mock, Settings(duplex=True))
+        assert err is not None and err.reason == "paper jam" and len(sheets) == 1
+        assert ops(mock)[-1] == 0xD6
+    finally:
+        mock.close()
+
+
+def test_jam_at_feed_holds_too() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=2)
+    mock.jam_at, mock.panel_choice = 1, "continue"
+    try:
+        sheets, err = run_scan(mock, Settings())
+        assert err is None and len(sheets) == 2
+    finally:
+        mock.close()
+
+
+def test_panel_decision() -> None:
+    # C2 blocks from the private ScanSnap Home decision captures (host ID bytes left out)
+    held = bytes.fromhex("00008000000001550000000004090000e000000000180000")
+    cont = bytes.fromhex("00008000010001550000000004090000e000000000190000")
+    finish = bytes.fromhex("00000080000001550000000004090800e000000000180000")
+    finish_keep = bytes.fromhex("00000080000001550000000004094000e000000000190000")
+    assert panel_decision(held, keep=True) is None
+    assert panel_decision(cont, keep=False) == FaultDecision(resume=True, keep=False)
+    assert panel_decision(finish, keep=True) == FaultDecision(resume=False, keep=False)
+    assert panel_decision(finish_keep, keep=False) == FaultDecision(resume=False, keep=True)
+    assert panel_decision(bytes(8), keep=True) is None

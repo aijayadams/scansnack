@@ -11,13 +11,15 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 
 ### Added
 
-- iX1500: double feeds are detected. The scan stops with a "double feed" error, the pages scanned before
-  it are kept, the double-fed sheet itself is not, and the touch panel's double-feed screen closes. A
-  crumpled sheet can be reported as a double feed too.
+- iX1500: double feeds are detected, and after a double feed or a paper jam the scan waits as it does
+  with ScanSnap Home: fix the paper and press *Scan* on the scanner to continue, or *Finish* to end the
+  scan (pages scanned before are kept). After a double feed the panel's choice to save the image decides
+  whether that sheet is kept. A crumpled sheet can be reported as a double feed too.
 - iX1500 (library): a computer can have several touch panel profiles, each with its own icon and colour,
   and the client can ask which one was tapped for a press. The client can also be told when the scanner
   has powered on.
-- iX1500 protocol notes: double feed and jam sequences, more C2 status bits, sense 3/80/02 (cover open),
+- iX1500 protocol notes: double feed and jam sequences and how the batch is held and continued, more C2
+  status bits with SANE's names, sense 3/80/02 (cover open), the color/300 block for all color modes,
   the boot notice, which profile was tapped, button notifications after the session has closed, and
   the touch panel's profile icons and colours.
 

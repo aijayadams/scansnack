@@ -32,11 +32,31 @@ class ImageInfo:
 
 @dataclass
 class Sheet:
-    """One fed sheet: finished JPEGs; ``back`` is None for simplex."""
+    """One fed sheet: finished JPEGs; ``back`` is None for simplex. ``fault`` names a paper fault the scanner
+    reported for this sheet (e.g. "double feed") when its images are delivered anyway."""
 
     front: bytes
     back: bytes | None
     info: ImageInfo | None
+    fault: str | None = None
+
+
+@dataclass(frozen=True)
+class Fault:
+    """A paper fault that holds the batch until the user decides: ``reason`` as in FeedError, ``sheet`` counts
+    from 1 within the batch."""
+
+    reason: str
+    sheet: int
+
+
+@dataclass(frozen=True)
+class FaultDecision:
+    """``resume``: continue the batch with the next sheet; otherwise it ends. ``keep``: deliver the faulty
+    sheet's images (only a double-fed sheet has any)."""
+
+    resume: bool
+    keep: bool
 
 
 @dataclass(frozen=True)

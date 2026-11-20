@@ -17,7 +17,7 @@ from . import wire
 from .button import ButtonListener, Notification
 from .control import Control, HostIdentity
 from .discovery import HOST_UDP_PORT, Heartbeat
-from .scanner import Scanner
+from .scanner import Decide, Scanner
 from .scsi import ScsiChannel
 
 ANNOUNCE_EVERY = 10.0  # ScanSnap Home repeats 0x0210 about every 10 s (cold capture)
@@ -50,6 +50,7 @@ class Session:
         self._hb: Heartbeat | None = None
         self._stop = threading.Event()
         self._announcer: threading.Thread | None = None
+        self.host_ip: str | None = None
 
     def open(self) -> ScsiChannel:
         ch = ScsiChannel(self.ip, self.ident.mac)
@@ -58,7 +59,7 @@ class Session:
             ch.start_polling()
             host_ip = None
             if self.handshake:
-                host_ip = self.ctl.handshake() if self.pair else self.ctl.connect()
+                host_ip = self.host_ip = self.ctl.handshake() if self.pair else self.ctl.connect()
                 print(f"Connected (host {host_ip}, ID {self.ident.host_id})", file=sys.stderr)
         finally:
             ch.close()
@@ -79,6 +80,11 @@ class Session:
             raise
         time.sleep(1.0)
         return self.ch
+
+    def announce(self) -> None:
+        """0x0210 now, e.g. while a scan holds ``lock`` and waits for the user (ScanSnap Home keeps sending it)."""
+        if self.host_ip:
+            self.ctl.announce(self.host_ip)
 
     def _start_announcer(self, host_ip: str) -> None:
         def run() -> None:
@@ -285,17 +291,20 @@ class Device:
         pair: bool = False,
         handshake: bool = True,
         heartbeat: bool = True,
+        decide: Decide | None = None,
+        keep_double_feed: bool = True,
     ) -> Iterator[Sheet]:
         """Scans all sheets in the feeder (``ports.scanner.ScannerPort``). Raises NoPaper if the feeder is empty.
 
         ``whiten`` sets the paper color to white (removes the background). ``select``, ``pair``, ``handshake``
         and ``heartbeat`` are switches for experiments (CLI) and only apply without ``keep_alive``.
+        ``decide`` and ``keep_double_feed``: see :meth:`scanner.Scanner.scan` (a held batch after a paper fault).
         """
         if not self.keep_alive:
             if select and not self.profile_id:
                 self.ensure_profile()
             with session(self.ctl, self.ip, self.ident, pair=pair, handshake=handshake, heartbeat=heartbeat) as ch:
-                yield from self._scan(ch, settings, select, whiten)
+                yield from self._scan(ch, settings, select, whiten, decide=decide, keep_double_feed=keep_double_feed)
             return
         for attempt in range(2):
             delivered = False
@@ -306,7 +315,16 @@ class Device:
                 if s.ch is None:
                     raise ConnectionError("session without a scan channel")
                 with s.lock:
-                    for sheet in self._scan(s.ch, settings, select, whiten, resume_polling=True):
+                    for sheet in self._scan(
+                        s.ch,
+                        settings,
+                        select,
+                        whiten,
+                        resume_polling=True,
+                        decide=decide,
+                        keep_double_feed=keep_double_feed,
+                        on_hold_tick=s.announce,
+                    ):
                         delivered = True
                         yield sheet
                 return
@@ -320,7 +338,16 @@ class Device:
                 print("Connection to the scanner lost – reconnecting", file=sys.stderr)
 
     def _scan(
-        self, ch: ScsiChannel, settings: ScanSettings, select: bool, whiten: bool, *, resume_polling: bool = False
+        self,
+        ch: ScsiChannel,
+        settings: ScanSettings,
+        select: bool,
+        whiten: bool,
+        *,
+        resume_polling: bool = False,
+        decide: Decide | None = None,
+        keep_double_feed: bool = True,
+        on_hold_tick: Callable[[], None] | None = None,
     ) -> Iterator[Sheet]:
         if select:
             self.stage = "selecting profile"
@@ -337,13 +364,14 @@ class Device:
             raise ConnectionError("scanner does not respond to C2")
         try:
             self.stage = f"scanning ({settings.mode}, {settings.dpi} dpi, {'duplex' if settings.duplex else 'simplex'})"
-            for sheet in Scanner(ch).scan(settings):
+            scanner = Scanner(ch, on_hold_tick=on_hold_tick)
+            for sheet in scanner.scan(settings, decide=decide, keep_double_feed=keep_double_feed):
                 if self.rotate or self.crop or whiten:
 
                     def fix(jpeg: bytes) -> bytes:
                         return process(jpeg, settings.dpi, rotate=self.rotate, crop=self.crop, whiten_background=whiten)
 
-                    sheet = Sheet(fix(sheet.front), sheet.back and fix(sheet.back), sheet.info)
+                    sheet = Sheet(fix(sheet.front), sheet.back and fix(sheet.back), sheet.info, sheet.fault)
                 yield sheet
             self.stage = "scan finished"
         finally:
