@@ -55,6 +55,15 @@ class MockScanner:
         self._pos = {0: 0, 1: 0}
         self._sense = sense()
         self.jam_at: int | None = None  # sheet number at which E0 reports a paper jam (3/80/01)
+        # sheet number whose back-side read ends with CHECK CONDITION and a non-image block, then sense 3/80/01,
+        # as in the private session capture
+        self.jam_in_read_at: int | None = None
+        # sheet number after which C2 reports a double feed (byte 6 bit 0, code 0x55 in byte 7). As in the private
+        # session capture the flag stays set after EE and D6 and is clear again once the next batch has started
+        # (UNVERIFIED: which of D5, D8, E9, D4 clears it; the mock clears it on D5).
+        self.double_feed_at: int | None = None
+        self.drop_on: int | None = None  # opcode on which the mock closes the connection instead of answering
+        self._fault = False
         self.srv = socket.create_server(("127.0.0.1", 0))
         self.port = self.srv.getsockname()[1]
         threading.Thread(target=self._serve, daemon=True).start()
@@ -83,6 +92,8 @@ class MockScanner:
                 if out_len != len(out):
                     raise AssertionError(f"out length field {out_len} != {len(out)} for {cdb.hex()}")
                 self.received.append((cdb, out))
+                if cdb[0] == self.drop_on:
+                    return
                 status, data = self._handle(cdb, in_len)
                 conn.sendall(wire.server_frame(b"\0" * 24 + data, status))
 
@@ -103,6 +114,10 @@ class MockScanner:
             return 0, b""
         if op == 0x28 and cdb[2] == 0x80:
             return 0, self.info
+        if op == 0x28 and cdb[10] == 1 and self._sheet == self.jam_in_read_at:
+            self._sense = sense(3, 0x80, 0x01)
+            # As in the private session capture: 34 bytes that are not an image chunk
+            return 2, bytes.fromhex("000100000a300000113000000a30000011300000012c012c00000a34000011300000")
         if op == 0x28:
             side, chunk = cdb[10], cdb[11]
             img = self.sheets[self._sheet][side]
@@ -114,5 +129,15 @@ class MockScanner:
                 self._sense = sense(eom=True, info=in_len - len(payload))
                 return 2, payload
             return 0, payload
+        if op == 0xC2 and self._sheet == self.double_feed_at and self._sheet >= 0:
+            self._fault = True
+        if op == 0xC2 and self._fault:
+            # As in the private double-feed capture
+            return 0, bytes.fromhex("00000080000001550000000004090000e0000000001800000000000000000000") + bytes(16)
+        if op == 0xD5:
+            self._fault = False
+        if op == 0xEE:
+            self.double_feed_at = None
+            return 0, b""
         rec = self.recorded.get(op)
         return (rec["status"], bytes.fromhex(rec["data"])) if rec else (0, b"")

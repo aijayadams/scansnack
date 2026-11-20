@@ -12,14 +12,16 @@ from scansnap.adapters.ix1500 import discovery, wire
 from scansnap.adapters.ix1500.control import (
     SUB_ANNOUNCE,
     SUB_SET_PROFILES,
+    SUB_TAPPED_PROFILE,
     Control,
     HostIdentity,
     json_body,
     parse_json_response,
+    plan_own_profiles,
     register_body,
 )
 from scansnap.adapters.ix1500.discovery import ScannerInfo, parse_reply
-from scansnap.adapters.ix1500.scanner import Scanner, mode_block, window_block
+from scansnap.adapters.ix1500.scanner import Scanner, double_feed, mode_block, read_len, window_block
 from scansnap.adapters.ix1500.scsi import ScsiChannel
 from scansnap.core.errors import FeedError, NoPaper
 from scansnap.core.fixes import IX1500_PAIRING_CLEANUP, Fixes
@@ -66,7 +68,7 @@ def test_scan_against_mock(fixture: str, settings: Settings) -> None:
         assert Image.open(io.BytesIO(jpeg)).size == Image.open(io.BytesIO(expected)).size
 
     ops = [cdb[0] for cdb, _ in mock.received if cdb[0] != 0x28]
-    assert ops[:5] == [0xD5, 0xD8, 0xE9, 0xD4, 0x03]
+    assert ops[:6] == [0xD5, 0xD8, 0xE9, 0xD4, 0xC2, 0x03]  # C2 after D4 as in the private double-feed capture
     assert ops[-1] == 0xD6
     sent = {cdb[0]: out for cdb, out in mock.received}
     assert sent[0xE9] == window_block(settings)
@@ -153,7 +155,10 @@ def test_session_open_and_polling_against_mock() -> None:
         mock.close()
     ops = [cdb[0] for cdb, _ in mock.received]
     assert ops[:4] == [0x12, 0x12, 0xE7, 0xC2] and ops.count(0xC2) > 2
-    assert 0xC2 not in ops[ops.index(0xD5) :]
+    # During the scan polling is paused; C2 only after D4 and after the sheet's info read (like ScanSnap Home).
+    during = mock.received[[c[0] for c, _ in mock.received].index(0xD5) :]
+    c2 = [i for i, (cdb, _) in enumerate(during) if cdb[0] == 0xC2]
+    assert [during[i - 1][0][:3] for i in c2] == [bytes.fromhex("d40000"), bytes.fromhex("280080")]
 
 
 def test_heartbeat_probe_and_reply_counting() -> None:
@@ -349,3 +354,151 @@ def test_paper_jam_keeps_earlier_pages_and_releases_session() -> None:
         assert mock.received[-1][0][0] == 0xD6
     finally:
         mock.close()
+
+
+def test_double_feed_stops_batch_acknowledges_and_releases_session() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=3)
+    mock.double_feed_at = 1  # the second sheet
+    pages: list[Sheet] = []
+    try:
+        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
+            pages.extend(Scanner(ch).scan(Settings()))
+        assert err.value.reason == "double feed" and "0x55" in str(err.value)
+        assert len(pages) == 1  # the double-fed sheet is not delivered
+        ops = [cdb[0] for cdb, _ in mock.received]
+        assert ops[-3:] == [0xC2, 0xEE, 0xD6]
+        assert mock.received[-2][1] == bytes.fromhex("0000005500000000")  # as ScanSnap Home sends it
+    finally:
+        mock.close()
+
+
+def test_next_batch_after_a_double_feed_scans_normally() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=2)
+    mock.double_feed_at = 0
+    try:
+        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch:
+            with pytest.raises(FeedError):
+                list(Scanner(ch).scan(Settings()))
+            mock.refill()
+            assert len(list(Scanner(ch).scan(Settings()))) == 2
+    finally:
+        mock.close()
+
+
+def test_double_feed_is_reported_when_the_connection_drops_on_ee() -> None:
+    mock = MockScanner("02_grayscale_simplex_normalquality", sheets=2)
+    mock.double_feed_at = 0
+    mock.drop_on = 0xEE  # EE and the D6 after it both fail
+    try:
+        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
+            list(Scanner(ch).scan(Settings()))
+        assert err.value.reason == "double feed"
+    finally:
+        mock.close()
+
+
+def test_double_feed_status() -> None:
+    # C2 blocks from the private double-feed capture (host ID bytes left out)
+    idle = bytes.fromhex("00000000000000000000000004090000e000000000180000")
+    double = bytes.fromhex("00000080000001550000000004090000e000000000180000")
+    assert double_feed(idle) is None
+    assert double_feed(double) == 0x55
+    assert double_feed(idle[:7] + b"\x42" + idle[8:]) is None  # an unknown code alone is not acted on
+    assert double_feed(bytes(4)) is None
+
+
+def test_color_300_uses_scansnap_home_blocks() -> None:
+    # E9 and D4 as ScanSnap Home sent them, read length from the same capture (private double-feed capture)
+    settings = Settings("color", 300)
+    assert window_block(settings).hex() == "012c012c000028d0000044dc05" + "00" * 19
+    assert (
+        mode_block(settings).hex()
+        == ("00030101d000c1808080908080000000000000000000000000000000000000300010012c012c05810d00000028d0000044dc04")
+        + "00" * 29
+    )
+    assert read_len(settings) == 0x300000
+
+
+def test_plan_own_profiles_keeps_ids() -> None:
+    ids = iter(["NEW1", "NEW2"])
+    base = {"icon_id": 1, "prof_name": "template"}
+    out = plan_own_profiles(
+        [{"prof_id": "OLD", "prof_name": "scansnap-bridge"}], ["A", "B"], base, 5, lambda: next(ids)
+    )
+    assert [(p["prof_name"], p["prof_id"], p["disp_order"], p["icon_id"]) for p in out] == [
+        ("A", "OLD", 5, 1),
+        ("B", "NEW1", 6, 1),
+    ]
+    mine = [{"prof_id": "2", "prof_name": "B"}, {"prof_id": "1", "prof_name": "A"}]
+    assert [p["prof_id"] for p in plan_own_profiles(mine, ["A", "B"], base, 1)] == ["1", "2"]
+    with pytest.raises(ValueError, match="unique"):
+        plan_own_profiles([], ["A", "A"], base, 1)
+    looks = plan_own_profiles([], ["A", "B"], dict(base, color_id=2), 1, lambda: "N", {"B": 83}, {"A": 6})
+    assert [(p["icon_id"], p["color_id"]) for p in looks] == [(1, 6), (83, 2)]
+
+
+def test_claim_with_profile_names_writes_one_profile_per_name() -> None:
+    ident = HostIdentity("scansnap-bridge", "8ff7d20fae1b79f6", "OWNUSER", bytes(6))
+    other_prof = {"user_id": "OTHER", "prof_id": "X", "disp_order": 3}
+    current: dict[str, Any] = {
+        "conn_user": {"users": [], "select": {"id": ident.host_id, "kind": 1}},
+        "profiles": [other_prof, {"user_id": "OWNUSER", "prof_id": "KEEP", "prof_name": "scansnap-bridge"}],
+        "version": 3,
+    }
+    payload = RecordingControl(ident, current).claim("192.168.178.37", ["Work", "Home"])
+    other, a, b = payload["profiles"]
+    assert other == other_prof
+    assert (a["prof_name"], a["prof_id"], a["disp_order"]) == ("Work", "KEEP", 4)
+    assert (b["prof_name"], b["disp_order"]) == ("Home", 5) and len(b["prof_id"]) == 32
+    assert a["user_id"] == b["user_id"] == "OWNUSER" and b["host_address"] == "192.168.178.37"
+
+
+class TappedControl(RecordingControl):
+    def __init__(self, reply: Any):
+        super().__init__(HostIdentity("t", "0f1e2d3c4b5a6978", "U", bytes(6)))
+        self.reply = reply
+
+    def json_call(self, sub: int, payload: Any | None = None) -> Any:
+        super().json_call(sub, payload)
+        return self.reply
+
+
+def test_tapped_profile() -> None:
+    ctl = TappedControl({"profiles": [{"prof_id": "P", "prof_name": "Home"}], "version": 3})
+    assert ctl.tapped_profile() == {"prof_id": "P", "prof_name": "Home"}
+    assert ctl.payloads == [(SUB_TAPPED_PROFILE, None)]
+    assert TappedControl({"profiles": [], "version": 3}).tapped_profile() is None
+    assert TappedControl(0).tapped_profile() is None
+
+
+def test_jam_during_a_read_reports_the_sense() -> None:
+    mock = MockScanner("03_grayscale_duplex_normalquality", sheets=3)
+    mock.jam_in_read_at = 1
+    pages: list[Sheet] = []
+    try:
+        with ScsiChannel("127.0.0.1", MAC, port=mock.port) as ch, pytest.raises(FeedError) as err:
+            pages.extend(Scanner(ch).scan(Settings(duplex=True)))
+        assert err.value.reason == "paper jam" and len(pages) == 1
+        ops = [cdb[0] for cdb, _ in mock.received]
+        assert ops[-3:] == [0x28, 0x03, 0xD6]  # sense read before giving up
+    finally:
+        mock.close()
+
+
+def test_claim_sets_the_user_color() -> None:
+    ident = HostIdentity("scansnap-bridge", "8ff7d20fae1b79f6", "OWNUSER", bytes(6))
+    current: dict[str, Any] = {
+        "conn_user": {"users": [], "select": {"id": ident.host_id, "kind": 1}},
+        "profiles": [],
+        "version": 3,
+    }
+    default = RecordingControl(ident, current).claim("192.168.178.37")
+    blue = RecordingControl(ident, current).claim("192.168.178.37", user_color=6)
+    assert default["conn_user"]["users"][-1]["color_id"] == 2
+    assert blue["conn_user"]["users"][-1]["color_id"] == 6
+    assert blue["profiles"][0]["color_id"] == 2  # profiles keep their own colour
+
+
+def test_tapped_profile_request_matches_capture() -> None:
+    # 0x0200 as ScanSnap Home sent it (private double-feed capture): sub-command, no JSON
+    assert json_body(0x0200, None).hex() == "00000010" + "0200" + "00" * 10 + "00000000"

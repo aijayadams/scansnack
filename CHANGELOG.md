@@ -9,6 +9,34 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 
 ## [Unreleased]
 
+### Added
+
+- iX1500: double feeds are detected. The scan stops with a "double feed" error, the pages scanned before
+  it are kept, the double-fed sheet itself is not, and the touch panel's double-feed screen closes. A
+  crumpled sheet can be reported as a double feed too.
+- iX1500 (library): a computer can have several touch panel profiles, each with its own icon and colour,
+  and the client can ask which one was tapped for a press. The client can also be told when the scanner
+  has powered on.
+- iX1500 protocol notes: double feed and jam sequences, more C2 status bits, sense 3/80/02 (cover open),
+  the boot notice, which profile was tapped, button notifications after the session has closed, and
+  the touch panel's profile icons and colours.
+
+### Changed
+
+- iX1500: the client listens for the Scan button while it connects, not only once connected, so a press
+  can be received while the connection is still being set up.
+- iX1500: "Document – Color" (color/300) scans use the parameter block ScanSnap Home sent for a 300 dpi
+  color scan.
+
+### Fixed
+
+- iX1500: a sheet that jams while it is being read is reported as a paper jam, instead of as an
+  "unexpected chunk header" error.
+- iX1500: when a scan stops with an error and the scanner cannot be released afterwards, the original
+  error is reported, not the failed release.
+- iX1500: a press on the touch panel is no longer ignored when the scanner was switched off and on and the
+  press got the same number as the last one before.
+
 ## [0.6.2] - 2026-11-19
 
 ### Added

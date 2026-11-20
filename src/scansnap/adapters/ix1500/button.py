@@ -1,7 +1,7 @@
 """Scan button on the touch panel: UDP notification to ``host_port`` of the selected host.
 
-Layout: docs/protocol-ix1500.md, section "Scan button on the touch panel". Only the UDP notification is evaluated
-(C2 can miss the short pulse).
+Layout: docs/protocol-ix1500.md, sections "Scan button on the touch panel" and "Boot notice". Only the UDP
+notification is evaluated (C2 can miss the short pulse). :class:`BootListener` handles the boot notice (UDP 53220).
 """
 
 from __future__ import annotations
@@ -11,9 +11,12 @@ import socket
 import struct
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..scansnap_wifi import notify
+from ..scansnap_wifi.notify import REPEAT_WINDOW
 from . import wire
 from .wire import MAGIC
 
@@ -33,7 +36,8 @@ def parse_notification(data: bytes) -> Notification | None:
     return Notification(data[16], str(ipaddress.IPv4Address(data[20:24])), data[24:30].hex(":"))
 
 
-# UNVERIFIED: how long the panel waits for the host after "Scan" is unknown.
+# UNVERIFIED: how long the panel waits for the host after "Scan"; about 32 s and about 10 s were seen live with
+# no session.
 
 
 class ButtonListener:
@@ -49,7 +53,7 @@ class ButtonListener:
             raise
         self.sock.settimeout(0.2)
         self.port = self.sock.getsockname()[1]
-        self._last: int | None = None
+        self._last: tuple[int, float] | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -66,15 +70,54 @@ class ButtonListener:
                 continue
             wire.trace("<- udp notify", data)
             note = parse_notification(data)
-            if note is None or note.counter == self._last:  # repeat of the same press
+            if note is None:
                 continue
-            self._last = note.counter
+            if not self._accept(note.counter, time.monotonic()):
+                continue
             try:
                 self.callback(note)
             except Exception as e:  # noqa: BLE001 – the listener must keep running
                 print(f"Scan button: {e}", file=sys.stderr)
+            self._handled(note.counter, time.monotonic())
+
+    def _accept(self, counter: int, now: float) -> bool:
+        """False for a repeat of the last press: same counter within ``REPEAT_WINDOW``. The counter restarts
+        after a power cycle, so an older notification with the same counter is a new press."""
+        if self._last and self._last[0] == counter and now - self._last[1] < REPEAT_WINDOW:
+            return False
+        self._last = (counter, now)
+        return True
+
+    def _handled(self, counter: int, now: float) -> None:
+        """Start the window again when the callback returns: repeats that queued up during a slow callback are
+        read only now."""
+        self._last = (counter, now)
 
     def close(self) -> None:
         self._stop.set()
         self._thread.join(2)
         self.sock.close()
+
+
+BOOT_PORT = 53220
+EVENT_BOOT = 0x21
+
+
+class BootListener(notify.Listener):
+    """Calls ``callback`` once per boot notice (event 0x21 on UDP 53220) from the scanner.
+
+    The iX1500 sent it after power-on (reboot capture: three times, to the host and as a broadcast). A host
+    holding a persistent session can reconnect as soon as it arrives.
+    """
+
+    # UNVERIFIED: only the power-on notice has been captured; a notice after waking from deep sleep was seen
+    # live but not captured. Event 0x30 on the same port after profile writes is ignored; its meaning is not
+    # known.
+
+    def __init__(self, scanner_ip: str, callback: Callable[[], None], port: int = BOOT_PORT):
+        def on_notice(note: notify.Notification) -> None:
+            if note.event == EVENT_BOOT:
+                callback()
+
+        super().__init__(scanner_ip, port, on_notice, magic=MAGIC)
+        self.port = self.sock.getsockname()[1]  # the bound port, also when ``port`` is 0
