@@ -11,13 +11,13 @@ from typing import Any, cast
 
 from ...core.fixes import Fixes
 from ...core.images import process
-from ...core.model import ScanSettings, Sheet
+from ...core.model import Decide, Fault, ScanSettings, Sheet
 from ...core.report import DeviceDiagnostics
 from . import wire
 from .button import ButtonListener, Notification
 from .control import Control, HostIdentity
 from .discovery import HOST_UDP_PORT, Heartbeat
-from .scanner import Decide, Scanner
+from .scanner import Scanner
 from .scsi import ScsiChannel
 
 ANNOUNCE_EVERY = 10.0  # ScanSnap Home repeats 0x0210 about every 10 s (cold capture)
@@ -168,6 +168,12 @@ class Device:
         self._session: Session | None = None
         self._button: ButtonListener | None = None
         self.stage = "idle"  # last step started, for error reports
+        self.decide: Decide | None = None
+        self._held = False  # the current scan waited for the user after a paper fault
+
+    def set_fault_handler(self, decide: Decide | None) -> None:
+        """``ports.scanner.HoldsBatch``: the default ``decide`` for :meth:`scan`."""
+        self.decide = decide
 
     def diagnostics(self) -> DeviceDiagnostics:
         """``ports.scanner.Diagnosable``."""
@@ -292,14 +298,17 @@ class Device:
         handshake: bool = True,
         heartbeat: bool = True,
         decide: Decide | None = None,
-        keep_double_feed: bool = True,
+        keep_double_feed: bool = False,
     ) -> Iterator[Sheet]:
         """Scans all sheets in the feeder (``ports.scanner.ScannerPort``). Raises NoPaper if the feeder is empty.
 
         ``whiten`` sets the paper color to white (removes the background). ``select``, ``pair``, ``handshake``
         and ``heartbeat`` are switches for experiments (CLI) and only apply without ``keep_alive``.
-        ``decide`` and ``keep_double_feed``: see :meth:`scanner.Scanner.scan` (a held batch after a paper fault).
+        ``decide`` (default: the one from :meth:`set_fault_handler`) and ``keep_double_feed``: see
+        :meth:`scanner.Scanner.scan` (a held batch after a paper fault). A held batch is not retried after a
+        connection loss, because the scanner would feed the next sheet without the user's answer.
         """
+        decide = decide or self.decide
         if not self.keep_alive:
             if select and not self.profile_id:
                 self.ensure_profile()
@@ -329,7 +338,7 @@ class Device:
                         yield sheet
                 return
             except (OSError, wire.ProtocolError):
-                if delivered or attempt:
+                if delivered or attempt or self._held:
                     self.disconnect()
                     raise
                 # Keep the button listener for the retry: it still has to recognise the repeats of the press
@@ -346,9 +355,10 @@ class Device:
         *,
         resume_polling: bool = False,
         decide: Decide | None = None,
-        keep_double_feed: bool = True,
+        keep_double_feed: bool = False,
         on_hold_tick: Callable[[], None] | None = None,
     ) -> Iterator[Sheet]:
+        self._held = False
         if select:
             self.stage = "selecting profile"
             prof_id = self.profile_id
@@ -364,7 +374,13 @@ class Device:
             raise ConnectionError("scanner does not respond to C2")
         try:
             self.stage = f"scanning ({settings.mode}, {settings.dpi} dpi, {'duplex' if settings.duplex else 'simplex'})"
-            scanner = Scanner(ch, on_hold_tick=on_hold_tick)
+            scanning = self.stage
+
+            def on_hold(fault: Fault) -> None:
+                self._held = True
+                self.stage = f"waiting for the user ({fault.reason} on sheet {fault.sheet})"
+
+            scanner = Scanner(ch, on_hold=on_hold, on_hold_tick=on_hold_tick)
             for sheet in scanner.scan(settings, decide=decide, keep_double_feed=keep_double_feed):
                 if self.rotate or self.crop or whiten:
 
@@ -372,6 +388,7 @@ class Device:
                         return process(jpeg, settings.dpi, rotate=self.rotate, crop=self.crop, whiten_background=whiten)
 
                     sheet = Sheet(fix(sheet.front), sheet.back and fix(sheet.back), sheet.info, sheet.fault)
+                self.stage = scanning
                 yield sheet
             self.stage = "scan finished"
         finally:

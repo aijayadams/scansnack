@@ -62,12 +62,15 @@ class MockScanner:
         # until the next D4 (see _handle)
         self.double_feed_at: int | None = None
         self.drop_on: int | None = None  # opcode on which the mock closes the connection instead of answering
+        self.drop_nth = 1  # ... on its n-th occurrence
         self._fault = False
-        # The user's answer on the touch panel while a batch is held after a paper fault, given after
-        # ``panel_after`` C2 polls: "continue" (byte 4 bit 0), "finish" (byte 14 bit 3) or "finish_keep"
-        # (byte 14 bit 6), as in the private ScanSnap Home decision captures. None: no answer.
+        # The user's answer on the touch panel while a batch is held after a paper fault, set in the C2 poll
+        # after ``panel_after`` polls and only in that one: "continue" (byte 4 bit 0), "finish" (byte 14 bit 3)
+        # or "finish_keep" (byte 14 bit 6), as in the private ScanSnap Home decision captures. None: no answer.
         self.panel_choice: str | None = "finish"
         self.panel_after = 2
+        self.panel_stuck = False  # the answer bit stays set from then on (not seen; for the client's edge check)
+        self._stuck: tuple[int, int] | None = None
         self._holding: int | None = None  # C2 polls while held
         self._refeed = False
         self.srv = socket.create_server(("127.0.0.1", 0))
@@ -99,7 +102,9 @@ class MockScanner:
                     raise AssertionError(f"out length field {out_len} != {len(out)} for {cdb.hex()}")
                 self.received.append((cdb, out))
                 if cdb[0] == self.drop_on:
-                    return
+                    self.drop_nth -= 1
+                    if not self.drop_nth:
+                        return
                 status, data = self._handle(cdb, in_len)
                 conn.sendall(wire.server_frame(b"\0" * 24 + data, status))
 
@@ -114,13 +119,13 @@ class MockScanner:
             st[:24] = bytes.fromhex("00000080000001550000000004090000e000000000180000")
         if self._holding is not None:
             self._holding += 1
-            if self._holding > self.panel_after:
-                if self.panel_choice == "continue":
-                    st[4] |= 0x01
-                elif self.panel_choice == "finish":
-                    st[14] |= 0x08
-                elif self.panel_choice == "finish_keep":
-                    st[14] |= 0x40
+            bit = {"continue": (4, 0x01), "finish": (14, 0x08), "finish_keep": (14, 0x40)}.get(self.panel_choice or "")
+            if bit and self._holding == self.panel_after + 1:
+                st[bit[0]] |= bit[1]
+                if self.panel_stuck:
+                    self._stuck = bit
+        if self._stuck:
+            st[self._stuck[0]] |= self._stuck[1]
         return bytes(st)
 
     def _handle(self, cdb: bytes, in_len: int) -> tuple[int, bytes]:

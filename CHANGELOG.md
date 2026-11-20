@@ -12,9 +12,11 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 ### Added
 
 - iX1500: double feeds are detected, and after a double feed or a paper jam the scan waits as it does
-  with ScanSnap Home: fix the paper and press *Scan* on the scanner to continue, or *Finish* to end the
-  scan (pages scanned before are kept). After a double feed the panel's choice to save the image decides
-  whether that sheet is kept. A crumpled sheet can be reported as a double feed too.
+  with ScanSnap Home: put the sheets back and press *Scan* on the scanner to continue, or *Finish* to end
+  the scan (pages scanned before are kept). The app's status line says what the scanner is waiting for;
+  without an answer the scan ends after 5 minutes. A double-fed sheet is kept only if *Finish* is followed
+  by saving the image on the scanner. Network scans (AirScan) still end at once. A crumpled sheet can be
+  reported as a double feed too.
 - iX1500 (library): a computer can have several touch panel profiles, each with its own icon and colour,
   and the client can ask which one was tapped for a press. The client can also be told when the scanner
   has powered on.
@@ -28,7 +30,7 @@ New entries go under *Unreleased*. When a release is made, the *Create Release* 
 - iX1500: the client listens for the Scan button while it connects, not only once connected, so a press
   can be received while the connection is still being set up.
 - iX1500: "Document – Color" (color/300) scans use the parameter block ScanSnap Home sent for a 300 dpi
-  color scan.
+  color scan, so `scansnap scan --mode color --dpi 300` no longer warns that it is not backed by captures.
 
 ### Fixed
 

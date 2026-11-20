@@ -242,19 +242,20 @@ Status 2 = CHECK CONDITION → fetch `03` REQUEST SENSE (18 B).
 
 ### C2 hardware status (0x30 bytes), every 250 ms
 
-ScanSnap Home keeps 53218 open permanently and polls C2 every 250 ms. During a scan the polling pauses.
-ScanSnap Home sends C2 once after D4 and once after each sheet's image info (double-feed and decision
-captures). While a batch is held after a paper fault it polls about every 300 ms; the touch panel's answer
-arrives only there (see [Held batch](#held-batch-after-a-double-feed-or-a-jam)). Bit names in parentheses
+ScanSnap Home keeps 53218 open permanently and polls C2 every 250 ms. During a scan the polling mostly
+pauses (in 6 of the batches in the decision captures one more C2 came between D5 and D8). ScanSnap Home
+sends C2 once after D4 and once after each sheet's image info (double-feed and decision captures). While a
+batch is held after a paper fault the normal 250 ms polling resumes, 0.8–1.1 s after D8 (7 holds); the touch
+panel's answer arrives only there (see [Held batch](#held-batch-after-a-double-feed-or-a-jam)). Bit names in parentheses
 are those of SANE's fujitsu backend (`backend/fujitsu-scsi.h`, `get_GHS_*`).
 
 | Data offset | Content |
 |---|---|
-| 2, bit 7 | (`top`) set while a jammed or double-fed sheet was in the scanner, cleared once it was taken out (session and decision captures) |
+| 2, bit 7 | (`top`) set during both captured jam holds until the cover was opened; set in 1 of 6 double-feed holds (until the sheet after the continue); also set for a few polls without any fault (two captures) |
 | 3, bit 7 | (`hopper`) feeder empty |
 | 3, bit 5 | (`adf_open`) cover open (session capture) |
 | 4, bit 0 | (`scan_sw`) scan button pressed (~0.3 s pulse); while a batch is held: "Scan" (continue) on the panel |
-| 4, bit 7 | (`sleep`) set in one capture while the scanner was asleep |
+| 4, bit 7 | (`sleep`) set in two captures while the scanner was asleep |
 | 6, bit 0 | (`double_feed`) double feed; stays set while the batch is held, clear after the next D4 |
 | 7 | (`error_code`) 0x55 with a double feed, otherwise 0 in all captures |
 | 14, bit 3 | while a batch is held: "Finish" on the panel, then "do not save the image" (decision captures) |
@@ -287,13 +288,16 @@ D6                  release session     (also after errors)
 - Pages arrive rotated by 180° and cover the whole scan area (width 2608 px at 300 dpi, length with
   ~50/110 px of background). Background ~235–240, paper ~252, shadow edge ~225 (live scans).
 - Scan area as sent by ScanSnap Home: width 0x28D0, height 0x44DC (1/1200 inch).
+- A slip about 2 cm tall scanned normally (session capture; the image info reports 504 lines at 300 dpi,
+  about 4.3 cm including margin).
 
 The E9/D4 parameter blocks for gray/150 and color/600 are byte-identical to the captures (read length
 0x300000 and 0x20000 respectively). For profile …0010 (color/300), ScanSnap Home sends a D4 that
 differs from the derived color/300 block in byte 10 (0x90), 13 (0x00) and 40 (0x0d). The quality captures
 have the full block: for profiles set to color, gray and monochrome at "Best" (superfine) ScanSnap Home sent
-the same E9 (300 dpi) and the same D4, so gray and monochrome are made from a color scan on the computer;
-at "Excellent" it was 600 dpi with one D4 for all three modes as well. The double-feed capture (automatic
+the same E9 (300 dpi) and the same D4, and the scanner returned 3-component JPEGs for all three, so the
+conversion to gray or monochrome is not done by the scanner; at "Excellent" it was 600 dpi with one D4 for
+all three modes as well. The double-feed capture (automatic
 color mode and resolution) has the same 300 dpi block with read length 0x300000. color/300 (the app's
 "Document – Color") uses this D4 and read length. Other combinations are derived (see
 [Open questions](#open-questions)).
@@ -303,35 +307,36 @@ color mode and resolution) has the same 300 dpi block with read length 0x300000.
 **Double feed**: the double-fed sheet's reads end with the normal EOM sense, and C2 after the sheet's image
 info shows the fault: byte 6 bit 0 set, error code 0x55 in byte 7. Crumpled single sheets set the same flag
 and code (session capture). **Jam while a page is read** (session and decision captures, a sheet held back
-by hand): the front's read ends normally; the back's read ends with CHECK CONDITION and 34 bytes that are
-not an image chunk (`00 01`, then what looks like an image info block), and REQUEST SENSE returns 3/80/01.
-A jam sense that is not read stays pending; in the session capture the next batch's first REQUEST SENSE
-returned it.
+by hand; 3 jams, all in the back side's read): the front's read ends normally; the back's read ends with
+CHECK CONDITION and 34 bytes that are not an image chunk (`00 01`, then what looks like an image info
+block), and REQUEST SENSE returns 3/80/01. A jam sense that is not read stays pending; once, in the session
+capture, the next batch's first REQUEST SENSE returned it. A jam reported by E0 has not been captured.
 
 ScanSnap Home then holds the batch (decision captures):
 
 ```
-double feed:  EE 00 00 00 08 00 (out 00 00 00 55 00 00 00 00), D8
-jam:          D8
-held:         C2 every ~300 ms (and 0x0210 every 10 s) until the user answers
+double feed:  EE 00 00 00 08 00 (out 00 00 00 55 00 00 00 00), D8     (6 of 6)
+jam:          D8                                                     (1 capture)
+held:         C2 every 250 ms (and 0x0210 every 10 s) until the user answers
 continue:     D8, E9, D4, C2 (flag clear), 03, E0 …   – no new D5
 end:          D6
 ```
 
 The user answers either in ScanSnap Home's window ("Continuous scan" / "Quit"; no traffic, the host just
 continues or ends) or on the touch panel, which ScanSnap Home sees only in C2: "Scan" sets byte 4 bit 0,
-"Finish" followed by "do not save the image" byte 14 bit 3, followed by "save the image" byte 14 bit 6.
-No UDP notification is sent for these. After a jam the panel offers "Scan" and "Finish" as well; the user
-puts the jammed sheet back before "Scan", and the next E0 feeds it again. After "continue" the next E0
-reports no sense for the double feed. ScanSnap Home's window shows the double-fed sheet's two sides with
-an option to keep the image; the images have already been read when the fault is known.
+"Finish" followed by "do not save the image" byte 14 bit 3 (once), followed by "save the image" byte 14 bit 6
+(once). Where the following poll was captured (3 answers), the bit was set in that one C2 poll only. No UDP notification is sent for these. After a jam
+the panel offers "Scan" and "Finish" as well; in the one jam capture the user put the jammed sheet back
+before "Scan", and the next E0 fed it again. After "continue" the next E0 reports no sense for the double
+feed. ScanSnap Home's window shows the double-fed sheet's two sides with an option to keep the image; the
+images have already been read when the fault is known.
 
-Our client does the same: it holds the batch, takes the panel's answer from C2 or an answer from the app
-(`decide`), delivers a double-fed sheet with `fault="double feed"` if it is kept, and continues or ends the
-batch with FeedError. The flag stays set after the batch has ended until the next one's D4 (session
-capture). Once, with the flag of an earlier batch still set, ScanSnap Home sent EE with
-`80 00 ff ff 00 00 00 00` before starting a new batch (decision captures). A slip about 2 cm tall (measured
-by hand; the image info reports 504 lines at 300 dpi, about 4.3 cm including margin) scanned normally.
+Our client does the same: it holds the batch, takes the panel's answer from C2 (only after a poll without
+one) or an answer from the app (`decide`), delivers a double-fed sheet with `fault="double feed"` if it is
+kept, and continues or ends the batch with FeedError. Without an answer it ends the batch after 5 minutes.
+The flag stays set after the batch has ended until the next one's D4 (session capture). Once, with the flag
+of an earlier batch still set, ScanSnap Home sent EE with `80 00 ff ff 00 00 00 00` before starting a new
+batch; the second time the same state came up it sent no EE (decision captures).
 
 ### Sense codes
 
@@ -549,3 +554,7 @@ Each item corresponds to an `# UNVERIFIED:` marker in the code (location in pare
 18. **Profile icons and colours** (`control.plan_own_profiles`): `color_id` 0 was not written on its own;
     icon ids 73, 75–82 and from 84 on were not written; why ScanSnap Home sent no 0x0610 for a panel press
     (one capture); what 0x0200 returns before any profile was tapped.
+19. **A jam reported by E0** (`scanner.Scanner.scan`): every captured jam ended a read; that E0's 3/80/01
+    leads to the same hold (D8, then "Scan" or "Finish" on the panel) is assumed.
+20. **The double-fed image after "Scan" on the panel** (`scanner.Scanner.scan`): whether ScanSnap Home keeps
+    it is not visible in the traffic; our client drops it unless `keep_double_feed` is set.

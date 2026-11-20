@@ -13,7 +13,16 @@ import time
 from collections.abc import Callable, Iterator
 
 from ...core.errors import FeedError, NoPaper
-from ...core.model import SCAN_HEIGHT_1200, SCAN_WIDTH_1200, Fault, FaultDecision, ImageInfo, ScanSettings, Sheet
+from ...core.model import (
+    SCAN_HEIGHT_1200,
+    SCAN_WIDTH_1200,
+    Decide,
+    Fault,
+    FaultDecision,
+    ImageInfo,
+    ScanSettings,
+    Sheet,
+)
 from . import wire
 from .scsi import CHECK_CONDITION, ScsiChannel, ScsiError, Sense
 
@@ -114,40 +123,51 @@ def _info_cdb(side: int) -> bytes:
     return bytes([0x28, 0, 0x80, 0, 0, 0x80 if side else 0, 0, 0, 0x20, 0, side, 0])
 
 
-Decide = Callable[[Fault], FaultDecision | None]
-
-
 class Scanner:
     """Scan sequence on an open scan channel.
 
     While a batch is held after a paper fault, C2 is polled every ``poll_interval`` seconds for the panel's
-    answer, and ``on_hold_tick`` (e.g. 0x0210, as ScanSnap Home sends it while waiting) is called every
-    ``tick_every`` seconds.
+    answer (ScanSnap Home keeps its normal 250 ms polling). ``on_hold`` is called once when a hold starts, and
+    ``on_hold_tick`` (e.g. 0x0210, as ScanSnap Home sends it while waiting) every ``tick_every`` seconds. After
+    ``hold_timeout`` seconds without an answer (None: never) the batch ends as with "Finish" and "do not save".
     """
 
     def __init__(
         self,
         channel: ScsiChannel,
         *,
-        poll_interval: float = 0.3,
+        poll_interval: float = 0.25,
+        on_hold: Callable[[Fault], None] | None = None,
         on_hold_tick: Callable[[], None] | None = None,
         tick_every: float = 10.0,
+        hold_timeout: float | None = 300.0,
     ):
         self.ch = channel
-        self.poll_interval, self.on_hold_tick, self.tick_every = poll_interval, on_hold_tick, tick_every
+        self.poll_interval, self.on_hold, self.on_hold_tick = poll_interval, on_hold, on_hold_tick
+        self.tick_every, self.hold_timeout = tick_every, hold_timeout
 
     def _hold(self, fault: Fault, decide: Decide | None, keep: bool) -> FaultDecision:
         """Wait for the user's answer, from the touch panel (C2) or from ``decide`` (None means "not yet")."""
-        ticked = time.monotonic()
+        if self.on_hold:
+            self.on_hold(fault)
+        started = ticked = time.monotonic()
+        # A panel answer counts only after a poll without one: in the captures each answer bit was set for a
+        # single poll, and one still set from an earlier answer must not answer this fault.
+        armed = False
         while True:
-            answer = panel_decision(self.ch.hardware_status(), keep)
+            on_panel = panel_decision(self.ch.hardware_status(), keep)
+            answer = on_panel if armed else None
+            armed = armed or on_panel is None
             if answer is None and decide is not None:
                 answer = decide(fault)
+            now = time.monotonic()
+            if answer is None and self.hold_timeout is not None and now - started >= self.hold_timeout:
+                answer = FaultDecision(resume=False, keep=False)
             if answer is not None:
                 return answer
-            if self.on_hold_tick and time.monotonic() - ticked >= self.tick_every:
-                ticked = time.monotonic()
-                with contextlib.suppress(OSError, wire.ProtocolError):
+            if self.on_hold_tick and now - ticked >= self.tick_every:
+                ticked = now
+                with contextlib.suppress(Exception):  # like the background 0x0210: a failure does not end the scan
                     self.on_hold_tick()
             time.sleep(self.poll_interval)
 
@@ -187,13 +207,13 @@ class Scanner:
         return [b"".join(p) for p in parts], last
 
     def scan(
-        self, settings: ScanSettings, *, decide: Decide | None = None, keep_double_feed: bool = True
+        self, settings: ScanSettings, *, decide: Decide | None = None, keep_double_feed: bool = False
     ) -> Iterator[Sheet]:
         """Scans all sheets in the feeder. Raises NoPaper if the feeder is empty.
 
         After a double feed or a jam the batch is held, as ScanSnap Home does, until the user answers on the
-        touch panel or ``decide`` returns an answer. "Continue" goes on with the next sheet: after a jam the
-        user puts the jammed sheet back. A double-fed sheet's images are delivered with ``fault="double
+        touch panel or ``decide`` returns an answer. "Continue" goes on with the next sheet: the user puts the
+        jammed or double-fed sheets back first. A double-fed sheet's images are delivered with ``fault="double
         feed"`` when the answer says ``keep``; for the panel's "continue" that is ``keep_double_feed``.
         Ending the batch raises FeedError, after the double-fed sheet if it is kept.
         """
@@ -218,7 +238,11 @@ class Scanner:
                     if e.reason != "paper jam":
                         raise
                     # ScanSnap Home: D8 (no EE), the panel offers "Scan" (continue) and "Finish" (jam capture).
-                    ch.checked(bytes.fromhex("d80000000000"))
+                    # UNVERIFIED: holding after a jam that E0 reports; only jams in a read were captured.
+                    try:
+                        ch.checked(bytes.fromhex("d80000000000"))
+                    except (OSError, wire.ProtocolError, ScsiError):
+                        raise e from None  # cannot hold the batch: report the jam
                     if not self._hold(Fault("paper jam", pages + 1), decide, keep=False).resume:
                         raise
                     self._start(settings)
@@ -238,6 +262,7 @@ class Scanner:
                     ch.checked(bytes.fromhex("d80000000000"))
                 except (OSError, wire.ProtocolError, ScsiError):
                     raise fault from None  # cannot hold the batch: report the double feed
+                # UNVERIFIED: whether ScanSnap Home keeps the image after "Scan" on the panel; not by default here.
                 answer = self._hold(Fault("double feed", pages + 1), decide, keep_double_feed)
                 if answer.keep:
                     pages += 1

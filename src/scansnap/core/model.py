@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -57,6 +58,10 @@ class FaultDecision:
 
     resume: bool
     keep: bool
+
+
+# Answer to a held batch: called while it waits for the user; None means "no answer yet"
+Decide = Callable[[Fault], FaultDecision | None]
 
 
 @dataclass(frozen=True)

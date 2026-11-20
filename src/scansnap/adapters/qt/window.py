@@ -59,9 +59,9 @@ from ...core.errors import FeedError, NoPaper, PasswordRejected
 from ...core.fixes import AVAILABLE as AVAILABLE_FIXES
 from ...core.fixes import Fix, Fixes
 from ...core.images import is_blank
-from ...core.model import FoundScanner, ScanSettings
+from ...core.model import Fault, FaultDecision, FoundScanner, ScanSettings
 from ...ports.output import OutputPort
-from ...ports.scanner import Diagnosable, PaperSensor, PasswordProtected, ScannerLocator, ScannerPort
+from ...ports.scanner import Diagnosable, HoldsBatch, PaperSensor, PasswordProtected, ScannerLocator, ScannerPort
 from . import primer
 from .report import ReportDialog, qt_fields
 from .updates import UpdateChecker, Updates
@@ -111,6 +111,8 @@ class ScanWorker(QObject):
         self.last_preset: Preset | None = None
         self.last_traceback = ""  # of the last unexpected scan error, for the error report
         self.password_asked = False  # the reconnect timer asks only once until a password is entered
+        self.stopping = False  # the window is closing: end a batch that waits for the user
+        self._held: Fault | None = None
 
     def _device(self) -> ScannerPort:
         """Persistently connected device for the current IP (disconnect the old one when the IP changes)."""
@@ -118,7 +120,22 @@ class ScanWorker(QObject):
             self.close_connection()
             self.device = self.locator.open(self.ip, on_button=self.button.emit)
             self.device_ip = self.ip
+            if isinstance(self.device, HoldsBatch):
+                self.device.set_fault_handler(self._on_fault)
         return self.device
+
+    def _on_fault(self, fault: Fault) -> FaultDecision | None:
+        """A batch held after a double feed or a jam (scan thread): the answer comes from the touch panel."""
+        if self.stopping:
+            return FaultDecision(resume=False, keep=False)
+        if fault != self._held:
+            self._held = fault
+            what = "Double feed" if fault.reason == "double feed" else "Paper jam"
+            fix = "Put the sheets back" if fault.reason == "double feed" else "Clear the jam, put the sheet back"
+            self.status.emit(
+                f"{what} on sheet {fault.sheet}. {fix} and press Scan on the scanner to continue, or Finish to stop."
+            )
+        return None
 
     @Slot()
     def open_connection(self) -> None:
@@ -157,7 +174,7 @@ class ScanWorker(QObject):
     @Slot(object)
     def scan(self, preset: Preset) -> None:
         count = skipped = 0
-        self.last_preset, self.last_traceback = preset, ""
+        self.last_preset, self.last_traceback, self._held = preset, "", None
         try:
             device = self._device()
             self.status.emit("Scanning …" if device.connected else "Connecting to the scanner …")
@@ -1182,6 +1199,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.reconnect_timer.stop()
+        self.worker.stopping = True  # a held batch ends instead of waiting for the panel
         self.scan_thread.quit()
         self.scan_thread.wait(2000)
         self.worker.close_connection()

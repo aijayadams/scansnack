@@ -17,7 +17,7 @@ from ..adapters.ix1500.identity import DEFAULT_PATH, load_or_create
 from ..adapters.ix1500.scanner import is_verified
 from ..adapters.ix1500.scsi import ScsiChannel
 from ..core.errors import NoPaper
-from ..core.model import ScanSettings, Sheet
+from ..core.model import Decide, Fault, ScanSettings, Sheet
 
 
 def _resolve_ip(args: argparse.Namespace, ident: HostIdentity) -> str:
@@ -71,6 +71,22 @@ def _save(pages: Iterable[Sheet], out: Path) -> int:
     return n
 
 
+def _tell_user() -> Decide:
+    """For a batch held after a paper fault: says once per fault that the answer is on the touch panel."""
+    told: list[Fault] = []
+
+    def decide(fault: Fault) -> None:
+        if fault not in told[-1:]:
+            told.append(fault)
+            print(
+                f"{fault.reason.capitalize()} on sheet {fault.sheet}: press Scan on the scanner to continue, "
+                "or Finish to stop.",
+                file=sys.stderr,
+            )
+
+    return decide
+
+
 def _listen(args: argparse.Namespace, ip: str, ident: HostIdentity) -> None:
     """Keep the session open and scan on every press of "Scan" on the touch panel."""
     import datetime as dt
@@ -78,6 +94,7 @@ def _listen(args: argparse.Namespace, ip: str, ident: HostIdentity) -> None:
 
     presses: queue.Queue[Notification] = queue.Queue()
     device = Device(ip, ident, args.profile_id, crop=not args.no_crop, keep_alive=True, on_button=presses.put)
+    device.set_fault_handler(_tell_user())
     device.connect()
     settings = ScanSettings(args.mode, args.dpi, args.duplex)
     print('Ready – press "Scan" on the scanner (Ctrl+C quits).', file=sys.stderr)
@@ -181,7 +198,9 @@ def main(argv: list[str] | None = None) -> None:
     settings = ScanSettings(args.mode, args.dpi, args.duplex)
     if not is_verified(settings):
         print(f"Warning: {args.mode}/{args.dpi} dpi is not backed by captures.", file=sys.stderr)
-    pages = Device(ip, ident, args.profile_id, crop=not args.no_crop).scan(
+    device = Device(ip, ident, args.profile_id, crop=not args.no_crop)
+    device.set_fault_handler(_tell_user())
+    pages = device.scan(
         settings, select=not args.no_select, pair=args.pair, handshake=not args.no_pair, heartbeat=not args.no_heartbeat
     )
     try:

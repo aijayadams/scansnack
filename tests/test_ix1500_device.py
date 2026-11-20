@@ -8,10 +8,11 @@ from typing import Any, ClassVar
 import pytest
 
 from mock_scanner import MockScanner
-from scansnap.adapters.ix1500 import device
+from scansnap.adapters.ix1500 import device, wire
 from scansnap.adapters.ix1500.button import Notification
 from scansnap.adapters.ix1500.control import Control, HostIdentity
 from scansnap.adapters.ix1500.scsi import ScsiChannel
+from scansnap.core.model import Fault, FaultDecision
 from scansnap.core.model import ScanSettings as Settings
 
 IDENT = HostIdentity("test", "00" * 8, "AB" * 16, bytes.fromhex("020000000001"))
@@ -324,3 +325,22 @@ def test_connect_restores_a_missing_listener(fake_sessions: Sessions, monkeypatc
     dev.connect()  # the session is still alive
     assert len(listeners) == 2
     dev.disconnect()
+
+
+def test_held_batch_uses_the_fault_handler_and_is_not_retried(fake_sessions: Sessions) -> None:
+    mocks, opened = fake_sessions
+    dev, _ = make_device()
+    dev.connect()
+    mocks[0].double_feed_at, mocks[0].panel_choice = 0, None
+    asked: list[tuple[Fault, str]] = []
+
+    def decide(fault: Fault) -> FaultDecision | None:
+        asked.append((fault, dev.stage))
+        channel(opened[0]).sock.shutdown(2)  # the connection drops while the batch waits
+        return None
+
+    dev.set_fault_handler(decide)
+    with pytest.raises((OSError, wire.ProtocolError)):
+        list(dev.scan(Settings()))
+    assert asked == [(Fault("double feed", 1), "waiting for the user (double feed on sheet 1)")]
+    assert len(opened) == 1  # no second session: it would feed the next sheet without an answer
